@@ -1,0 +1,27 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- Virtual environment (local only) ----
+venv/
+
+# ---- Bundled ffmpeg binaries (external dep, too large for git) ----
+ffmpeg/
+
+# ---- Generated outputs ----
+output/
+thumbs/
+scenes_*.txt
+
+# ---- Test media (binary sample videos) ----
+test/
+
+# ---- Backup copies ----
+*.bak-*
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.swp
