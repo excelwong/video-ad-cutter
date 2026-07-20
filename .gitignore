@@ -54,3 +54,13 @@ GITHUB_PUSH_STATE.md
 *.flac
 *.ogg
 *.wma
+# 模型权重 / 大文件（不入库，按需下载）
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+*.gguf
+*.safetensors
+weights/
+**/weights/
