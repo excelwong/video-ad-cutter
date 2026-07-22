@@ -17,6 +17,19 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 _OUTPUT_DIR = os.path.join(_BASE, "output")
 _ENC = None  # chosen encoder (set after probe)
 
+# 支持的视频扩展名（拖入文件时用于识别第一个有效视频）
+_VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".m4v",
+               ".mpg", ".mpeg", ".ts", ".m2ts"}
+
+# 拖放支持：优先用 windnd（仅调用系统 shell32/user32，走 Windows 原生
+# WM_DROPFILES，不加载任何第三方 DLL —— 本机的「应用程序控制策略」(WDAC)
+# 会拦截未受信任的第三方 DLL，故不能用 tkinterdnd2）。导入失败则自动降级
+# 为「仅文件对话框选择」，不影响其它功能。
+try:
+    import windnd as _windnd
+except Exception:
+    _windnd = None
+
 
 class App:
     def __init__(self, root):
@@ -48,16 +61,22 @@ class App:
 
         ttk.Label(top, text="视频文件:").grid(row=0, column=0, sticky="w")
         self.path_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.path_var, width=70).grid(
-            row=0, column=1, sticky="ew", padx=6)
+        self.path_entry = ttk.Entry(top, textvariable=self.path_var, width=70)
+        self.path_entry.grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(top, text="选择视频", command=self.on_select).grid(row=0, column=2)
         self.detect_btn = ttk.Button(top, text="检测转场", command=self.on_detect)
         self.detect_btn.grid(row=0, column=3, padx=6)
         self.detect_btn.config(state="disabled")
 
-        self.info_var = tk.StringVar(value="未选择视频")
+        dnd_hint = ("（也可将视频文件直接拖入本窗口）" if _windnd
+                    else "（提示：拖放库未启用，仅支持点击“选择视频”）")
+        self.info_var = tk.StringVar(value="未选择视频  " + dnd_hint)
         ttk.Label(top, textvariable=self.info_var, foreground="#555").grid(
             row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        top.columnconfigure(1, weight=1)
+
+        # 注册拖放：把视频文件拖入输入框或整个窗口即可加载
+        self._setup_dnd()
 
         # Segment area (scrollable)
         mid = ttk.Frame(self.root)
@@ -107,6 +126,49 @@ class App:
         enc_name = "GPU (NVENC)" if self.encoder == "h264_nvenc" else "CPU (libx264)"
         self.info_var.set(f"编码器: {enc_name}    CUDA 13.1 / RTX 2060 兼容")
 
+    # ---------- drag & drop ----------
+    def _setup_dnd(self):
+        """注册文件拖放（windnd，走系统原生 WM_DROPFILES，无第三方 DLL）。"""
+        if not _windnd:
+            return
+        try:
+            # 拖到输入框或主窗口任意位置都能接住
+            _windnd.hook_dropfiles(self.path_entry, func=self._on_drop_files)
+            _windnd.hook_dropfiles(self.root, func=self._on_drop_files)
+        except Exception:
+            pass
+
+    def _on_drop_files(self, files):
+        """windnd 回调（在主线程触发）：取第一个视频文件加载。
+
+        windnd 传入的是 bytes 路径列表，需按平台编码解码；这里对
+        gbk / utf-8 / mbcs 依次尝试，尽量兼容中文路径。
+        """
+        if self.busy:
+            messagebox.showinfo("提示", "正在处理中，请稍候再拖入新文件。")
+            return
+        paths = []
+        for f in files or []:
+            if isinstance(f, bytes):
+                for enc in ("gbk", "utf-8", "mbcs"):
+                    try:
+                        f = f.decode(enc)
+                        break
+                    except Exception:
+                        continue
+                else:
+                    continue
+            paths.append(f)
+        # 取第一个扩展名为视频的文件；都不是则取第一个并提示
+        video = next((p for p in paths
+                      if os.path.splitext(p)[1].lower() in _VIDEO_EXTS), None)
+        if not video:
+            if paths:
+                messagebox.showwarning(
+                    "提示", "拖入的文件不是受支持的视频格式：\n" + paths[0])
+            return
+        self._load_path(video)
+
     # ---------- handlers ----------
     def on_select(self):
         path = filedialog.askopenfilename(
@@ -114,6 +176,13 @@ class App:
             filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi *.flv *.wmv *.webm *.m4v"),
                        ("所有文件", "*.*")])
         if not path:
+            return
+        self._load_path(path)
+
+    def _load_path(self, path):
+        """加载一个视频路径（文件对话框选择 / 拖入 共用）。"""
+        if not path or not os.path.isfile(path):
+            messagebox.showerror("提示", f"文件不存在：\n{path}")
             return
         self.video_path = path
         self.path_var.set(path)
@@ -212,6 +281,19 @@ class App:
         except Exception as e:
             ok, msg = False, f"异常: {e}"
         self.q.put(("done", ok, msg, out))
+
+    def _cleanup_thumbs(self):
+        """导出完成后删除 output/thumbs 里的缩略图。
+
+        界面上的缩略图早已以 PNG 数据载入内存（self.thumb_imgs），删除磁盘
+        上的 jpg 不会影响已显示的卡片，也不动 output 下的其它文件。
+        """
+        thumb_dir = os.path.join(self.output_dir, "thumbs")
+        try:
+            if os.path.isdir(thumb_dir):
+                shutil.rmtree(thumb_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     def on_open(self):
         if self.last_out and os.path.isfile(self.last_out):
@@ -385,6 +467,7 @@ class App:
                     if ok:
                         self.last_out = out
                         self.open_btn.config(state="normal")
+                        self._cleanup_thumbs()
                         self.status_var.set(msg)
                         messagebox.showinfo("完成", msg)
                     else:

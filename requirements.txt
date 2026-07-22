@@ -1,3 +1,4 @@
 numpy
 opencv-python-headless
 Pillow
+windnd  # 文件拖放（仅调用系统 shell32/user32，规避 WDAC 对第三方 DLL 的拦截）
