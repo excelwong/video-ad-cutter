@@ -13,6 +13,7 @@ even if the ad segment had a different resolution/fps.
 GPU: tries h264_nvenc first (RTX 2060 / NVENC), and transparently falls
 back to libx264 (CPU) if the GPU encoder is unavailable or errors.
 """
+import datetime
 import os
 import re
 import shutil
@@ -20,6 +21,9 @@ import tempfile
 
 from utils import (get_ffmpeg, has_nvenc, probe_video, probe_segment,
                    run_capture)
+
+# 应用所在目录（错误日志写到这里）
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _TIME_RE = re.compile(r"time=(\d+:\d+:\d+\.\d+)")
 _TIME2_RE = re.compile(r"time=(\d+\.\d+)")
@@ -184,6 +188,148 @@ def merge(video_path, kept_scenes, out_path, encoder=None, preset="p4",
     finally:
         if own_tmp:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# 原编码流拷贝路径（需求：切割 + 拼接都用主视频原编码，不重新编码）
+# --------------------------------------------------------------------------
+_INDEX_KEYS = ("moov atom", "moov", "no moov", "atom not found",
+               "could not find codec", "invalid data found", "missing moov",
+               "index", "non-monoton", "dts/pts", "out of range")
+
+
+def _looks_like_index_issue(msg):
+    """粗略判断 ffmpeg 报错是否像「视频索引/moov 缺失」类问题。"""
+    low = (msg or "").lower()
+    return any(k in low for k in _INDEX_KEYS)
+
+
+def _rebuild_index(ffmpeg, video_path, tmp_dir):
+    """重建视频索引（把 moov atom 移到文件头并重建索引）后返回新文件路径；失败返回 None。"""
+    rb = os.path.join(tmp_dir, "_rebuilt_index.mp4")
+    # 优先：copy + faststart（把 moov 移到头部）
+    rc, _ = run_capture([ffmpeg, "-y", "-i", video_path,
+                          "-c", "copy", "-movflags", "+faststart", rb])
+    if rc == 0 and os.path.isfile(rb) and os.path.getsize(rb) > 0:
+        return rb
+    # 回退：仅 copy（某些封装不需要 faststart）
+    rc, _ = run_capture([ffmpeg, "-y", "-i", video_path, "-c", "copy", rb])
+    if rc == 0 and os.path.isfile(rb) and os.path.getsize(rb) > 0:
+        return rb
+    return None
+
+
+def _write_error_log(app_dir, video_path, out_path, msg, kept_scenes):
+    """把详细错误（ffmpeg 命令/返回码/stderr/片段清单）写入应用目录的日志文件。"""
+    os.makedirs(app_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(app_dir, f"vacut_error_{ts}.log")
+    lines = [
+        "=== video-ad-cutter 流拷贝失败（详细错误）===\n",
+        f"时间: {ts}\n",
+        f"源视频: {video_path}\n",
+        f"目标输出: {out_path}\n",
+        f"保留片段数: {len(kept_scenes)}\n",
+    ]
+    for i, s in enumerate(kept_scenes):
+        lines.append(
+            f"  段{i + 1}: {s.get('start')} -> {s.get('end')} "
+            f"时长 {s.get('duration')}\n")
+    lines.append("\n--- ffmpeg 错误信息 ---\n")
+    lines.append(msg or "(无)\n")
+    lines.append(
+        "\n说明: 已尝试用主视频原编码流拷贝('-c copy')；若提示索引/moov 缺失，"
+        "已重建索引重试；此处为仍失败的其他问题，未做任何重新编码。\n")
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception:
+        pass
+    return log_path
+
+
+def _try_copy_cut(ffmpeg, video_path, kept_scenes, out_path,
+                  tmp_dir, progress_cb, attempt):
+    """用 -c copy 切割每个保留段 + concat -c copy 拼接。
+
+    返回 (ok, error_msg)。成功时 error_msg 是成功提示；失败时包含失败命令与 ffmpeg stderr。
+    """
+    total = len(kept_scenes)
+    seg_files = []
+    for i, seg in enumerate(kept_scenes):
+        seg_out = os.path.join(tmp_dir, f"seg_{i:03d}.mp4")
+        cmd = [ffmpeg, "-y", "-ss", f"{seg['start']:.3f}", "-i", video_path,
+                "-t", f"{seg['duration']:.3f}", "-c", "copy", seg_out]
+        rc, err = run_capture(cmd)
+        if rc != 0 or not os.path.isfile(seg_out) or os.path.getsize(seg_out) == 0:
+            return False, (f"片段 {i + 1}/{total} 流拷贝失败 (attempt={attempt}):\n"
+                            f"命令: {' '.join(cmd)}\n返回码: {rc}\n"
+                            f"{err[-3000:]}")
+        seg_files.append(seg_out)
+        if progress_cb:
+            progress_cb(min(0.95, (i + 1) / total * 0.95),
+                        f"流拷贝片段 {i + 1}/{total}")
+    if progress_cb:
+        progress_cb(0.97, "合并片段中(原编码)...")
+    list_path = os.path.join(tmp_dir, "list.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for sf in seg_files:
+            f.write(f"file '{os.path.abspath(sf)}'\n")
+    concat_cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0",
+                  "-i", list_path, "-c", "copy", out_path]
+    rc, err = run_capture(concat_cmd)
+    if rc != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+        return False, (f"合并(concat -c copy)失败 (attempt={attempt}):\n"
+                        f"命令: {' '.join(concat_cmd)}\n返回码: {rc}\n"
+                        f"{err[-3000:]}")
+    return True, (f"已导出(主视频原编码流拷贝，未重新编码): {out_path}\n"
+                  f"共 {total} 段；体积与原片保持一致（仅裁剪掉未保留部分）。")
+
+
+def merge_streamcopy(video_path, kept_scenes, out_path, progress_cb=None,
+                     tmp_dir=None, app_dir=None):
+    """用主视频**原编码**裁剪并拼接保留片段（不重新编码）。
+
+    流程：
+      1. 逐段 `-c copy` 切割 + `concat -c copy` 拼接；
+      2. 若失败且疑似「视频索引/moov 缺失」，重建索引后重试一次；
+      3. 仍为其他问题 -> 把详细错误写入应用目录的 vacut_error_<时间戳>.log。
+    """
+    ffmpeg, _ = get_ffmpeg()
+    app_dir = app_dir or _APP_DIR
+    if not kept_scenes:
+        return False, "没有保留任何片段，无法导出。"
+
+    own_tmp = tmp_dir is None
+    if own_tmp:
+        tmp_dir = tempfile.mkdtemp(prefix="vacut_sc_")
+
+    # 第一次尝试（原视频直接流拷贝）
+    ok, msg = _try_copy_cut(ffmpeg, video_path, kept_scenes, out_path,
+                             tmp_dir, progress_cb, attempt=0)
+    if ok:
+        if own_tmp:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return True, msg
+
+    # 疑似索引问题 -> 重建索引后重试
+    if _looks_like_index_issue(msg):
+        rb = _rebuild_index(ffmpeg, video_path, tmp_dir)
+        if rb:
+            ok2, msg2 = _try_copy_cut(ffmpeg, rb, kept_scenes, out_path,
+                                       tmp_dir, progress_cb, attempt=1)
+            if ok2:
+                if own_tmp:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                return True, msg2
+            msg = msg2
+
+    # 其他问题 -> 写详细错误日志到应用目录
+    log_path = _write_error_log(app_dir, video_path, out_path, msg, kept_scenes)
+    if own_tmp:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return False, (f"流拷贝失败（非索引问题，或重建索引后仍失败）。\n"
+                    f"未重新编码。详细错误已写入：\n{log_path}")
 
 
 if __name__ == "__main__":

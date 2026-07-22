@@ -204,8 +204,11 @@ class App:
         def cb(frac, status):
             self.q.put(("progress", frac, status))
         try:
-            ok, msg = merger.merge(self.video_path, kept, out,
-                                   encoder=self.encoder, progress_cb=cb)
+            # 用主视频原编码流拷贝裁剪+拼接（不重新编码）；
+            # 疑似索引缺失会自动重建索引重试，其他问题写详细日志到应用目录。
+            ok, msg = merger.merge_streamcopy(
+                self.video_path, kept, out,
+                progress_cb=cb, app_dir=_BASE)
         except Exception as e:
             ok, msg = False, f"异常: {e}"
         self.q.put(("done", ok, msg, out))
@@ -263,6 +266,24 @@ class App:
             self._add_card(idx, sc, cols)
         self._refresh_target()
 
+    def _load_thumb_image(self, thumb):
+        """把缩略图解码/缩放后转成 Tk 原生 PhotoImage。
+
+        改用「PIL 解码+缩放 -> PNG bytes -> tk.PhotoImage(data=...)」的方式，
+        彻底绕开 Pillow 的 ImageTk._imagingtk DLL——该 DLL 在本机会被
+        「应用程序控制策略」拦截导致加载失败（表现为“预览生成失败”）。
+        Tk 8.6 自带 PNG 解码器，因此这条路径不依赖任何被封的 DLL。
+        """
+        import io
+        import base64
+        from PIL import Image
+        with Image.open(thumb) as im:
+            im = im.convert("RGB").resize((240, 135))
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+        data = base64.b64encode(buf.getvalue())
+        return tk.PhotoImage(data=data)
+
     def _add_card(self, idx, sc, cols):
         f = ttk.LabelFrame(self.inner, text=f"段 {idx + 1}")
         r, c = divmod(idx, cols)
@@ -272,10 +293,7 @@ class App:
         thumb = sc.get("thumb")
         if thumb and os.path.isfile(thumb):
             try:
-                from PIL import Image, ImageTk
-                im = Image.open(thumb).convert("RGB")
-                im = im.resize((240, 135))
-                img = ImageTk.PhotoImage(im)
+                img = self._load_thumb_image(thumb)
                 lbl = tk.Label(f, image=img, bg="#222")
                 lbl.image = img
                 self.thumb_imgs.append(img)
@@ -336,7 +354,7 @@ class App:
         sr = (self.full_probe["audio"]["sample_rate"]
               if self.full_probe and self.full_probe.get("audio") else 0)
         self.target_var.set(
-            f"目标规格(主体视频): {w}×{h}  |  {fps:.3f}fps"
+            f"输出规格(主视频原编码·流拷贝，不重新编码): {w}×{h}  |  {fps:.3f}fps"
             + (f"  |  音频 {sr}Hz" if sr else "  |  无音频"))
 
     # ---------- poll ----------
