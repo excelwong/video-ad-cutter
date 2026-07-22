@@ -21,14 +21,15 @@ _ENC = None  # chosen encoder (set after probe)
 _VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".m4v",
                ".mpg", ".mpeg", ".ts", ".m2ts"}
 
-# 拖放支持：优先用 windnd（仅调用系统 shell32/user32，走 Windows 原生
-# WM_DROPFILES，不加载任何第三方 DLL —— 本机的「应用程序控制策略」(WDAC)
-# 会拦截未受信任的第三方 DLL，故不能用 tkinterdnd2）。导入失败则自动降级
-# 为「仅文件对话框选择」，不影响其它功能。
-try:
-    import windnd as _windnd
-except Exception:
-    _windnd = None
+# 拖放支持：用 ctypes 子类化 Tk 窗口过程（WNDPROC），在回调里**只**用
+# 系统 shell32/user32 读取拖入路径、写入一个普通 Python 列表，绝不调用 Tk；
+# 真正的 GUI 操作放到主线程的 after 轮询器里执行——否则在 Python 3.13 / Tk
+# 下会与 Tcl 的 GIL 管理冲突，于 Tk_MainLoop 内触发致命崩溃：
+#   PyEval_RestoreThread: GIL is released (thread state is NULL)
+# （windnd / 旧版 ctypes 实现都因在回调里碰了 Tk 而同样崩溃。）
+# 本机「应用程序控制策略」(WDAC) 会拦截未受信任的第三方 DLL，故不能用
+# tkinterdnd2；本方案仅依赖系统 DLL，无此问题。非 Windows 自动降级为
+# 「仅文件对话框选择」。
 
 
 class App:
@@ -68,8 +69,8 @@ class App:
         self.detect_btn.grid(row=0, column=3, padx=6)
         self.detect_btn.config(state="disabled")
 
-        dnd_hint = ("（也可将视频文件直接拖入本窗口）" if _windnd
-                    else "（提示：拖放库未启用，仅支持点击“选择视频”）")
+        # 拖放基于系统 shell32/user32（ctypes），Windows 下默认可用
+        dnd_hint = "（也可将视频文件直接拖入本窗口）"
         self.info_var = tk.StringVar(value="未选择视频  " + dnd_hint)
         ttk.Label(top, textvariable=self.info_var, foreground="#555").grid(
             row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -128,21 +129,111 @@ class App:
 
     # ---------- drag & drop ----------
     def _setup_dnd(self):
-        """注册文件拖放（windnd，走系统原生 WM_DROPFILES，无第三方 DLL）。"""
-        if not _windnd:
+        """注册文件拖放（ctypes 子类化 WNDPROC + 主线程轮询器）。
+
+        ⚠️ 关键：WNDPROC 回调里**绝不调用 Tk**（哪怕 widget.after(0, ...)
+        也会在 Python 3.13 / Tk 下与 Tcl 的 GIL 管理冲突，于
+        Tk_MainLoop 内触发致命崩溃：
+            PyEval_RestoreThread: GIL is released (thread state is NULL)
+        （windnd / 旧版 ctypes 实现都因在回调里碰了 Tk 而同样崩溃。）
+        故 WNDPROC 只把拖入路径存入 self._pending_drops，真正的
+        GUI 操作(_on_drop_files)放到主线程 after 轮询器里执行（此时安全）。
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
             return
+        if not hasattr(ctypes.windll, "shell32"):
+            return
+
+        shell32 = ctypes.windll.shell32
+        user32 = ctypes.windll.user32
+        WM_DROPFILES = 0x0233
+        GWL_WNDPROC = -4
+
+        try:
+            user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            user32.CallWindowProcW.restype = ctypes.c_int64
+            user32.CallWindowProcW.argtypes = [
+                ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                wintypes.WPARAM, wintypes.LPARAM,
+            ]
+            shell32.DragQueryFileW.restype = ctypes.c_int
+            shell32.DragQueryFileW.argtypes = [
+                wintypes.HANDLE, ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_uint,
+            ]
+            shell32.DragFinish.argtypes = [wintypes.HANDLE]
+            shell32.DragAcceptFiles.argtypes = [wintypes.HWND, ctypes.c_int]
+        except Exception:
+            return
+
+        WndProc = ctypes.WINFUNCTYPE(
+            ctypes.c_int64, wintypes.HWND, wintypes.UINT,
+            wintypes.WPARAM, wintypes.LPARAM,
+        )
+
+        def _hook(widget):
+            hwnd = widget.winfo_id()
+            old_proc = user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+
+            def wndproc(h, msg, wp, lp):
+                if msg == WM_DROPFILES:
+                    try:
+                        count = shell32.DragQueryFileW(wp, 0xFFFFFFFF, None, 0)
+                        paths = []
+                        for i in range(count):
+                            length = shell32.DragQueryFileW(wp, i, None, 0) + 1
+                            buf = ctypes.create_unicode_buffer(length)
+                            shell32.DragQueryFileW(wp, i, buf, length)
+                            paths.append(buf.value)
+                        shell32.DragFinish(wp)
+                        if paths:
+                            if not isinstance(getattr(self, "_pending_drops", None), list):
+                                self._pending_drops = []
+                            self._pending_drops.extend(paths)
+                    except Exception:
+                        pass
+                    return 0
+                return user32.CallWindowProcW(old_proc, h, msg, wp, lp)
+
+            new_proc = WndProc(wndproc)
+            user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, ctypes.cast(new_proc, ctypes.c_void_p))
+            shell32.DragAcceptFiles(hwnd, True)
+            widget._drop_wndproc = new_proc  # 保活
+
         try:
             # 拖到输入框或主窗口任意位置都能接住
-            _windnd.hook_dropfiles(self.path_entry, func=self._on_drop_files)
-            _windnd.hook_dropfiles(self.root, func=self._on_drop_files)
+            _hook(self.path_entry)
+            _hook(self.root)
         except Exception:
             pass
 
-    def _on_drop_files(self, files):
-        """windnd 回调（在主线程触发）：取第一个视频文件加载。
+        # 主线程轮询器：在 mainloop 正常上下文里处理拖入（此时调用 Tk 安全）
+        def _poll():
+            try:
+                pending = getattr(self, "_pending_drops", None)
+                if isinstance(pending, list) and pending:
+                    self._pending_drops = []
+                    self._on_drop_files(pending)
+            except Exception:
+                try:
+                    self._pending_drops = []
+                except Exception:
+                    pass
+            self.root.after(150, _poll)
 
-        windnd 传入的是 bytes 路径列表，需按平台编码解码；这里对
-        gbk / utf-8 / mbcs 依次尝试，尽量兼容中文路径。
+        self._pending_drops = []
+        self.root.after(150, _poll)
+
+    def _on_drop_files(self, files):
+        """主线程轮询器回调（在 mainloop 正常上下文里触发，可安全操作 GUI）：
+        取第一个视频文件加载。files 为 str 路径列表（WNDPROC 已用
+        DragQueryFileW 读出），兼容直接传入；如仍是 bytes 则按 gbk / utf-8 /
+        mbcs 依次解码以兼容中文路径。
         """
         if self.busy:
             messagebox.showinfo("提示", "正在处理中，请稍候再拖入新文件。")
