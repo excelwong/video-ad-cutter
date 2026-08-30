@@ -1,6 +1,7 @@
 """GUI for the video ad-removal tool (tkinter)."""
 import os
 import queue
+import re
 import shutil
 import threading
 import tkinter as tk
@@ -21,6 +22,41 @@ _ENC = None  # chosen encoder (set after probe)
 _VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".m4v",
                ".mpg", ".mpeg", ".ts", ".m2ts"}
 
+# 自动命名输出时可原样沿用的容器扩展名（其余一律落到 .mp4）。
+# 只保留流拷贝大概率能装下原编码流的容器，避免 -c copy 时
+# "codec not supported in container" 之类的失败。
+_OUT_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
+
+# 预览缩略图的像素宽（_load_thumb_image 里固定缩放到这个宽）；
+# 一行能放几张 = 画布可用宽 // 单张卡片估算宽。卡片由「缩略图宽 + 左右内边距 +
+# LabelFrame 边框」组成，下面留一点余量避免最右边一张被滚动条压住。
+_THUMB_W = 240
+_CARD_W = _THUMB_W + 28   # 240 缩略图 + 卡片 padx(6*2) + LabelFrame 边框/内边距余量
+
+
+def _fmt_export_status(frac, status, total_kept):
+    """把 merger 内部的进度文本翻译成用户友好的「正在合并第 X 段」说明。
+
+    merger 各路线回报的文案不统一（如「无损切割 2/5」「流拷贝片段 1/3」
+    「合并片段中…」），这里统一成「正在合并第 X 段视频，共 Y 段（ZZ%）」，
+    并补上「保留 N 段」的总览。不影响进度条（frac 原样回传）。
+    """
+    pct = int(max(0.0, min(1.0, frac)) * 100)
+    m = re.search(r"(\d+)\s*/\s*(\d+)", status)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if b > 1:
+            return f"正在合并第 {a} 段视频，共 {b} 段（{pct}%）"
+        if b == 1:
+            # 快路径：保留内容首尾相连、无需逐段切分（如「全部保留」），
+            # 仍给一句明确说明，避免进度栏一片空白。
+            return (f"正在合并为最终视频（保留 {total_kept} 段，"
+                    f"已首尾相连无需逐段切分）（{pct}%）")
+    if "合并" in status:
+        return f"正在合并所有片段，生成最终视频（{pct}%）"
+    # 兜底：保留 merger 原文案（如「完成」），并把保留段数总览带上
+    return f"{status}（共保留 {total_kept} 段）" if total_kept else status
+
 # 拖放支持：用 ctypes 子类化 Tk 窗口过程（WNDPROC），在回调里**只**用
 # 系统 shell32/user32 读取拖入路径、写入一个普通 Python 列表，绝不调用 Tk；
 # 真正的 GUI 操作放到主线程的 after 轮询器里执行——否则在 Python 3.13 / Tk
@@ -37,16 +73,21 @@ class App:
         self.root = root
         self.root.title("视频广告去除工具  ·  Video Ad Cutter")
         self.root.geometry("1100x740")
+        # 启动时最大化。直接 state("zoomed") 在某些 Tk 版本下因为窗口尚未
+        # realize(映射) 会被忽略，所以延后到主循环真正跑起来之后再用 after 设一次，
+        # 双保险。
         try:
             self.root.state("zoomed")
         except Exception:
             pass
+        self.root.after(0, self._zoom_window)
 
         self.video_path = None
         self.full_probe = None
         self.scenes = []
         self.vars = []
         self.thumb_imgs = []
+        self._sel_anchor = None     # Shift 范围多选的锚点（片段下标）
         self.q = queue.Queue()
         self.busy = False
         self.last_out = None
@@ -74,6 +115,11 @@ class App:
         self.info_var = tk.StringVar(value="未选择视频  " + dnd_hint)
         ttk.Label(top, textvariable=self.info_var, foreground="#555").grid(
             row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        # 输出文件不再弹对话框让用户选，直接按「源目录 / 原名-adcut.扩展名」
+        # 自动命名；这里常驻显示实际会写到哪里，避免用户找不到产物。
+        self.out_var = tk.StringVar(value="输出文件: （未选择视频）")
+        ttk.Label(top, textvariable=self.out_var, foreground="#0a6a2a").grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
         top.columnconfigure(1, weight=1)
 
         # 注册拖放：把视频文件拖入输入框或整个窗口即可加载
@@ -101,8 +147,8 @@ class App:
         # Bottom controls
         bot = ttk.Frame(self.root, padding=8)
         bot.pack(fill="x")
-        ttk.Button(bot, text="全选保留", command=self._sel_all).grid(row=0, column=0, padx=3)
-        ttk.Button(bot, text="全不选(删除全部)", command=self._sel_none).grid(
+        ttk.Button(bot, text="全部选中", command=self._sel_all).grid(row=0, column=0, padx=3)
+        ttk.Button(bot, text="全部取消(删除全部)", command=self._sel_none).grid(
             row=0, column=1, padx=3)
         self.target_var = tk.StringVar(value="目标规格: 勾选“保留”的片段将按顺序拼接；"
                                               "最终视频按主体视频(保留片段的最后一段)的分辨率/帧率导出。")
@@ -115,6 +161,19 @@ class App:
         self.export_btn.config(state="disabled")
         self.open_btn = ttk.Button(bot, text="打开输出目录", command=self.on_open)
         self.open_btn.grid(row=0, column=4)
+
+        # 导出模式：默认「无损」= 切点对齐关键帧 + 全程 -c copy（零重编码）。
+        # 「精确」= smart cut，切点精确但切点处会重编码。
+        self.mode_var = tk.StringVar(value="lossless")
+        mbar = ttk.Frame(bot)
+        mbar.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        ttk.Label(mbar, text="导出模式:").pack(side="left")
+        ttk.Radiobutton(mbar, text="无损（对齐关键帧，不重编码）",
+                        value="lossless", variable=self.mode_var,
+                        command=self._refresh_target).pack(side="left", padx=(6, 0))
+        ttk.Radiobutton(mbar, text="精确（切点分秒不差，切点处少量重编码）",
+                        value="precise", variable=self.mode_var,
+                        command=self._refresh_target).pack(side="left", padx=(10, 0))
         self.open_btn.config(state="disabled")
 
         self.progress = ttk.Progressbar(self.root, orient="horizontal",
@@ -126,6 +185,14 @@ class App:
 
         enc_name = "GPU (NVENC)" if self.encoder == "h264_nvenc" else "CPU (libx264)"
         self.info_var.set(f"编码器: {enc_name}    CUDA 13.1 / RTX 2060 兼容")
+
+    # ---------- window state ----------
+    def _zoom_window(self):
+        """把窗口设为最大化（Windows 下 wm_state("zoomed")）。"""
+        try:
+            self.root.state("zoomed")
+        except Exception:
+            pass
 
     # ---------- drag & drop ----------
     def _setup_dnd(self):
@@ -280,6 +347,9 @@ class App:
         self.detect_btn.config(state="normal")
         self.export_btn.config(state="disabled")
         self.open_btn.config(state="disabled")
+        # 关键帧表是按 (路径, mtime, 大小) 缓存的，换了文件旧标记必须清掉，
+        # 否则会拿上一个视频的关键帧去预估新视频
+        self.kf_ready = False
         self._reset()
         try:
             self.full_probe = utils.probe_video(path)
@@ -292,6 +362,9 @@ class App:
             info = f"已选择，但读取信息失败: {e}"
         self.info_var.set(info)
         self.status_var.set("点击“检测转场”开始切分视频。")
+        # 提前把自动输出路径显示出来（导出前就让用户知道会写到哪里）
+        out = self._default_output_path()
+        self.out_var.set("输出文件: " + (out or "（无法确定）"))
 
     def on_detect(self):
         if not self.video_path or self.busy:
@@ -304,18 +377,45 @@ class App:
         self._poll()
 
     def _detect_worker(self):
+        # 注意：这里必须捕获 BaseException 而不只是 Exception。若工作线程
+        # 静默死掉又没往队列里放东西，主线程 _poll 会一直空转、busy 永远
+        # 是 True，表现为"程序吊死且所有按钮点不动"。
         try:
             if self.full_probe is None:
                 self.full_probe = utils.probe_video(self.video_path)
             scenes = detector.detect_scenes(
-                self.video_path, progress_cb=self._detect_progress)
+                self.video_path, progress_cb=self._detect_progress,
+                status_cb=self._detect_status)
+            # 缩略图阶段：检测刚跑完时进度条已是 100%，若这里不给反馈，
+            # 界面会静止数秒（片段多时更久），看着像"检测到最后卡住了"。
+            self.q.put(("progress", 1.0, "转场检测完成，正在生成预览缩略图…"))
             thumb_dir = os.path.join(self.output_dir, "thumbs")
             shutil.rmtree(thumb_dir, ignore_errors=True)
             previewer.build_previews(self.video_path, scenes, thumb_dir,
-                                     progress_cb=None)
+                                     progress_cb=self._thumb_progress)
             self.q.put(("detected", scenes))
-        except Exception as e:
-            self.q.put(("error", str(e)))
+        except BaseException as e:      # noqa: BLE001 - 兜底，保证一定回传
+            import traceback
+            traceback.print_exc()
+            try:
+                self.q.put(("error", f"{e}\n\n{detector.get_last_detail()}".strip()))
+            except Exception:
+                pass
+
+    def _detect_status(self, msg):
+        """检测器降级时的即时提示（在后台线程调用，只入队不碰 Tk）。"""
+        try:
+            self.q.put(("status_only", msg))
+        except Exception:
+            pass
+
+    def _thumb_progress(self, i, n):
+        """缩略图生成进度（后台线程调用）。"""
+        try:
+            frac = 1.0
+            self.q.put(("progress", frac, f"正在生成预览缩略图… {i}/{n}"))
+        except Exception:
+            pass
 
     def _detect_progress(self, frame, n_frames):
         """检测进度回调（由检测器在后台线程调用）。
@@ -345,33 +445,92 @@ class App:
         if not kept:
             messagebox.showerror("提示", "请至少保留一段视频。")
             return
-        out = filedialog.asksaveasfilename(
-            title="保存导出视频", defaultextension=".mp4",
-            filetypes=[("MP4", "*.mp4"), ("MKV", "*.mkv")],
-            initialfile="output_no_ad.mp4")
+        # 输出路径自动生成（源目录 / 原名-adcut.扩展名），不再弹保存对话框。
+        # 重名时自动追加 _2 / _3 …，绝不覆盖已有文件。
+        out = self._default_output_path()
         if not out:
+            messagebox.showerror("提示", "无法确定输出路径。")
             return
-        if os.path.abspath(out) == os.path.abspath(self.video_path):
-            messagebox.showerror("提示", "输出文件不能与源文件相同。")
-            return
+        self.out_var.set("输出文件: " + out)
+        self.status_var.set(f"开始导出：共保留 {len(kept)} 段视频，正在准备…")
         self._set_busy(True)
         self.open_btn.config(state="disabled")
-        threading.Thread(target=self._export_worker, args=(kept, out),
+        # ⚠️ Tk 变量只能在主线程读！_export_worker 跑在后台线程，在里面调
+        # self.mode_var.get() 会抛 RuntimeError: main thread is not in
+        # main loop —— 表现就是"点了导出没反应/直接报错"。所以这里先取好值
+        # 再作为参数传进去。
+        mode = self.mode_var.get() if getattr(self, "mode_var", None) \
+            else "lossless"
+        threading.Thread(target=self._export_worker, args=(kept, out, mode),
                         daemon=True).start()
         self._poll()
 
-    def _export_worker(self, kept, out):
+    def _default_output_path(self):
+        """导出文件的默认路径：源视频所在目录 + 原文件名 + "-adcut" + 原扩展名。
+
+        - 扩展名沿用源文件（如 .mp4 / .mkv / .mov），这样 -c copy 流拷贝进
+          同一个容器类型，不会出现"编码流塞不进容器"的失败；不认识的扩展名
+          一律落到 .mp4。
+        - 目标已存在时自动追加 _2 / _3 …，**不覆盖**已有文件（同一视频反复
+          调整片段导出也不会把上一次的结果冲掉）。
+        """
+        if not self.video_path:
+            return ""
+        src = os.path.abspath(self.video_path)
+        d = os.path.dirname(src)
+        base, ext = os.path.splitext(os.path.basename(src))
+        if ext.lower() not in _OUT_EXTS:
+            ext = ".mp4"
+        candidate = os.path.join(d, f"{base}-adcut{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        i = 2
+        while i < 1000:
+            c = os.path.join(d, f"{base}-adcut_{i}{ext}")
+            if not os.path.exists(c):
+                return c
+            i += 1
+        return ""
+
+    def _export_worker(self, kept, out, mode="lossless"):
+        total_kept = len(kept)
+        # 先把「保留 N 段」总览推到主线程，免得 merger 首个回调前状态栏空白
+        self.q.put(("status_only", f"开始导出：共保留 {total_kept} 段视频…"))
         def cb(frac, status):
-            self.q.put(("progress", frac, status))
+            self.q.put(("progress", frac, _fmt_export_status(frac, status, total_kept)))
+        ok, msg = False, "未知错误"
         try:
-            # 用主视频原编码流拷贝裁剪+拼接（不重新编码）；
-            # 疑似索引缺失会自动重建索引重试，其他问题写详细日志到应用目录。
+            # 默认「无损」：切点对齐关键帧 + 全程 -c copy（零重编码）；
+            # 不可用（如保留段短于一个 GOP）时自动回退 smart cut；
+            # 疑似索引缺失会重建索引重试，其他问题写详细日志到应用目录。
             ok, msg = merger.merge_streamcopy(
                 self.video_path, kept, out,
-                progress_cb=cb, app_dir=_BASE)
-        except Exception as e:
+                progress_cb=cb, app_dir=_BASE, mode=mode)
+        except BaseException as e:     # noqa: BLE001 - 同 _detect_worker
+            import traceback
+            traceback.print_exc()
             ok, msg = False, f"异常: {e}"
+        # 无条件回传，否则主线程会一直 busy=True
         self.q.put(("done", ok, msg, out))
+
+    def _warm_keyframes(self):
+        """后台扫一遍关键帧表（无损模式的预估需要它）。
+
+        ffprobe 扫长视频要几百毫秒到数秒，不能放在主线程（会卡界面）。
+        merger._keyframe_times 内部按 (路径, mtime, 大小) 缓存，扫完一次
+        之后 _refresh_target 里的预估就是纯内存计算了。
+        """
+        def work():
+            try:
+                merger._keyframe_times(utils.get_ffmpeg()[1], self.video_path)
+            except Exception:
+                return
+            try:
+                self.q.put(("kf_ready",))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _cleanup_thumbs(self):
         """导出完成后删除 output/thumbs 里的缩略图。
@@ -434,10 +593,35 @@ class App:
         for w in list(self.inner.children.values()):
             w.destroy()
         self.thumb_imgs = []
-        cols = 3
+        # ⚠️ 必须一并清空 vars：_add_card 会往里 append，若不清空，
+        # 二次检测后 vars 会变成 2N 个，而 export 取的是 vars[0:N]
+        # —— 用的是【上一轮】的勾选状态，导致"取消勾选没生效"。
+        self.vars = []
+        self._sel_anchor = None     # 旧下标已失效，锚点必须一起清
+        cols = self._compute_cols()
         for idx, sc in enumerate(self.scenes):
             self._add_card(idx, sc, cols)
         self._refresh_target()
+
+    def _compute_cols(self):
+        """按当前窗口宽度决定每行缩略图张数。
+
+        窗口已最大化时画布宽≈屏幕宽(减滚动条/边距)，据此一行能放
+        (画布宽 // 单卡估算宽) 张；至少为 1。画布尚未布局好(宽<=1)时
+        退回到屏幕宽度估算，保证「检测转场」后首次渲染就有合理列数。
+        """
+        try:
+            w = self.canvas.winfo_width()
+        except Exception:
+            w = 0
+        if w <= 1:
+            try:
+                w = self.root.winfo_screenwidth()
+            except Exception:
+                w = 0
+        if w <= 1:
+            return 3     # 实在拿不到宽度时的保守默认
+        return max(1, max(3, w // _CARD_W))  # 至少 3 列，避免小窗反而更少
 
     def _load_thumb_image(self, thumb):
         """把缩略图解码/缩放后转成 Tk 原生 PhotoImage。
@@ -451,7 +635,7 @@ class App:
         import base64
         from PIL import Image
         with Image.open(thumb) as im:
-            im = im.convert("RGB").resize((240, 135))
+            im = im.convert("RGB").resize((_THUMB_W, int(_THUMB_W * 135 / 240)))
             buf = io.BytesIO()
             im.save(buf, format="PNG")
         data = base64.b64encode(buf.getvalue())
@@ -484,17 +668,45 @@ class App:
 
         var = tk.IntVar(value=1)
         self.vars.append(var)
-        # 点击截图即可切换“保留”复选框状态（带选中高亮反馈）
-        self._bind_thumb_toggle(lbl, var)   # 必须在 var 定义之后调用
+        # 点击截图即可切换“保留”复选框状态（带选中高亮反馈）；
+        # 按住 Shift 点击第二张 = 把锚点到这张之间的所有片段统一置为锚点的状态
+        self._bind_thumb_toggle(lbl, var, idx)   # 必须在 var 定义之后调用
         cb = ttk.Checkbutton(f, text="保留（取消=删除）", variable=var,
                               command=self._refresh_target)
         cb.grid(row=2, column=0, sticky="w", padx=4, pady=2)
 
 
-    def _bind_thumb_toggle(self, lbl, var):
-        """点击缩略图即可切换对应片段的“保留/删除”复选状态。"""
-        def on_click(_event):
-            var.set(0 if var.get() else 1)
+    def _bind_thumb_toggle(self, lbl, var, idx):
+        """点击缩略图切换“保留/删除”；按住 Shift 可批量处理一个连续区间。
+
+        交互（与文件管理器一致）：
+          · 普通点击 —— 切换这一张，同时把它设为**锚点**；
+          · Shift + 点击 —— 把「锚点 → 当前这张」之间（含两端）的所有片段
+            统一置为**锚点当前的状态**。所以「Shift 点第一张把它取消，
+            再 Shift 点最后一张」= 整段区间全部取消选中；反过来先 Shift 点
+            一张未选中的，再 Shift 点另一张，则整段区间全部选中。
+          · 一次区间操作完成后锚点清空，下次 Shift 点击重新起锚，避免
+            上一次的锚点把新区间拉长。
+        """
+        def on_click(event):
+            # event.state 的 bit0 = Shift（Tk 通用掩码，Windows/Linux 一致）
+            shift = bool(getattr(event, "state", 0) & 0x0001)
+            anchor = getattr(self, "_sel_anchor", None)
+            if shift and anchor is not None and anchor != idx \
+                    and 0 <= anchor < len(self.vars):
+                target = self.vars[anchor].get()
+                lo, hi = (anchor, idx) if anchor < idx else (idx, anchor)
+                for i in range(lo, hi + 1):
+                    self.vars[i].set(target)
+                # 区间已应用，清锚点；否则下次 Shift 点击会从旧锚点一路拉过来
+                self._sel_anchor = None
+                n = hi - lo + 1
+                self.status_var.set(
+                    f"已{'选中' if target else '取消'}第 {lo + 1}–{hi + 1} 段"
+                    f"（共 {n} 段）")
+            else:
+                var.set(0 if var.get() else 1)
+                self._sel_anchor = idx
             self._refresh_target()
         lbl.bind("<Button-1>", on_click)
         lbl.config(cursor="hand2")  # 提示可点击
@@ -526,48 +738,136 @@ class App:
         fps = self.full_probe["video"]["fps"] if self.full_probe else 0
         sr = (self.full_probe["audio"]["sample_rate"]
               if self.full_probe and self.full_probe.get("audio") else 0)
+        # 两种模式下的输出规格都一样（沿用源流），区别只在切点怎么处理。
+        precise = (getattr(self, "mode_var", None)
+                   and self.mode_var.get() == "precise")
+        if precise:
+            note = ("精确模式：切点分秒不差，切点处少量重编码，"
+                    "中间大段仍是原编码流拷贝")
+        else:
+            note = ("无损模式：切点对齐关键帧，全程原编码流拷贝、零重编码；"
+                    "每个切点最多少保留一个关键帧间隔")
+            note += self._lossless_hint(kept)
         self.target_var.set(
-            f"输出规格(主视频原编码·流拷贝，不重新编码): {w}×{h}  |  {fps:.3f}fps"
+            f"输出规格({note}): {w}×{h}  |  {fps:.3f}fps"
             + (f"  |  音频 {sr}Hz" if sr else "  |  无音频"))
+
+    def _lossless_hint(self, kept):
+        """无损模式的**事前**预告：对齐关键帧会少保留多少 / 会不会回退。
+
+        关键帧表由 _warm_keyframes 后台预热，没准备好就先不显示（返回空串），
+        避免把 ffprobe 的耗时留在主线程里。
+        """
+        if not getattr(self, "kf_ready", False) or not self.video_path:
+            return ""
+        try:
+            pv = merger.preview_lossless(utils.get_ffmpeg()[1],
+                                         self.video_path, kept)
+        except Exception:
+            return ""
+        if not pv:
+            return "；读不到关键帧表，将自动改用精确模式"
+        if not pv["usable"]:
+            return (f"；有 {pv['dropped']} 段比关键帧间隔还短，"
+                    f"无损模式无法保留，将自动改用精确模式")
+        if pv["lost"] > 0.005:
+            return (f"；本次预计少保留 {pv['lost']:.2f}s"
+                    f"（保留 {pv['kept']:.2f}s / 原 {pv['raw']:.2f}s）")
+        return "；切点恰好都在关键帧上，不丢内容"
 
     # ---------- poll ----------
     def _poll(self):
+        """主线程队列轮询（唯一允许操作 Tk 的地方）。
+
+        ⚠️ 关键：单个消息的处理必须各自 try/except，且重排 after 的逻辑要
+        放在最后无条件执行。原来只要某个 handler（例如 _render_segments）
+        抛异常，就会连带跳过续排，轮询链直接断掉 —— busy 永远为 True、
+        所有按钮禁用、界面彻底"吊死"且无任何提示。
+
+        ⚠️ 第二坑（2026-08-29 修）：原来写成 ``if self.busy: after(...)``，
+        只在忙碌时才续排。但**空闲期间也会有消息入队** —— 例如检测完成
+        后 busy 已转 False，此时后台预热关键帧的线程投递 ``kf_ready``，
+        轮询链却已经停了，消息永远滞留在队列里：界面上的"预计少保留多少秒"
+        提示再也不更新，看着就像程序死掉了。
+        （test3.mp4 上表现为：检测 35s 结束后界面静止不动。）
+        所以这里**无条件续排**，用 ``_poll_scheduled`` 防止重复排多条链。
+        """
         try:
             while True:
                 item = self.q.get_nowait()
-                kind = item[0]
-                if kind == "detected":
-                    self.scenes = item[1]
-                    self._render_segments()
-                    self.export_btn.config(state="normal")
-                    self.status_var.set(
-                        f"检测到 {len(self.scenes)} 段。取消勾选要删除的广告片段，"
-                        f"然后点击“导出视频”。")
-                    self._set_busy(False)
-                elif kind == "error":
-                    messagebox.showerror("错误", item[1])
-                    self.status_var.set("检测失败")
-                    self._set_busy(False)
-                elif kind == "progress":
-                    self.progress["value"] = max(0, min(100, item[1] * 100))
-                    self.status_var.set(item[2])
-                elif kind == "done":
-                    ok, msg, out = item[1], item[2], item[3]
-                    self.progress["value"] = 100 if ok else self.progress["value"]
-                    self._set_busy(False)
-                    if ok:
-                        self.last_out = out
-                        self.open_btn.config(state="normal")
-                        self._cleanup_thumbs()
-                        self.status_var.set(msg)
-                        messagebox.showinfo("完成", msg)
-                    else:
-                        self.status_var.set("导出失败")
-                        messagebox.showerror("失败", msg)
+                try:
+                    self._handle_item(item)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
         except queue.Empty:
             pass
-        if self.busy:
-            self.root.after(120, self._poll)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        # 链上已有定时就不重复排（on_detect / on_export 都会调 _poll，
+        # 若每次都排会并存多条链）；这里只负责"确保链在跑"。
+        if not getattr(self, "_poll_scheduled", False):
+            try:
+                self._poll_scheduled = True
+                self.root.after(120, self._after_poll)
+            except Exception:
+                self._poll_scheduled = False    # 窗口已销毁，链自然终止
+
+    def _after_poll(self):
+        """after 定时回调：先清标记（本次定时已兑现），再走 _poll。
+
+        必须经由这里清标记 —— 若让 _poll 自己清，那么 on_detect /
+        on_export 这些**外部调用**也会把标记清掉再重排，导致每调一次就
+        多并存一条轮询链。
+        """
+        self._poll_scheduled = False
+        self._poll()
+
+    def _handle_item(self, item):
+        kind = item[0]
+        if kind == "detected":
+            self.scenes = item[1]
+            self._render_segments()
+            self.export_btn.config(state="normal")
+            method = detector.get_last_method()
+            method_txt = {"gpu": "GPU 硬解", "cpu": "CPU 软解",
+                          "opencv": "OpenCV 兜底"}.get(method, method)
+            detail = detector.get_last_detail()
+            self.status_var.set(
+                f"检测到 {len(self.scenes)} 段（{method_txt}）。"
+                + (f"　[降级原因: {detail}]" if detail else "")
+                + "点预览图切换保留/删除，按住 Shift 点两张可批量处理中间所有片段；"
+                  "然后点击“导出视频”（输出文件名自动生成）。")
+            self._set_busy(False)
+            # 后台预热关键帧表，供无损模式"预计少保留多少秒"的提示使用
+            self._warm_keyframes()
+        elif kind == "kf_ready":
+            self.kf_ready = True
+            self._refresh_target()
+        elif kind == "error":
+            messagebox.showerror("错误", item[1])
+            self.status_var.set("检测失败")
+            self._set_busy(False)
+        elif kind == "progress":
+            self.progress["value"] = max(0, min(100, item[1] * 100))
+            self.status_var.set(item[2])
+        elif kind == "status_only":
+            # 只更新提示文字、不动进度条（降级/阶段切换提示用）
+            self.status_var.set(item[1])
+        elif kind == "done":
+            ok, msg, out = item[1], item[2], item[3]
+            self.progress["value"] = 100 if ok else self.progress["value"]
+            self._set_busy(False)
+            if ok:
+                self.last_out = out
+                self.open_btn.config(state="normal")
+                self._cleanup_thumbs()
+                self.status_var.set(msg)
+                messagebox.showinfo("完成", msg)
+            else:
+                self.status_var.set("导出失败")
+                messagebox.showerror("失败", msg)
 
     def _set_busy(self, b):
         self.busy = b

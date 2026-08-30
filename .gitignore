@@ -64,3 +64,6 @@ GITHUB_PUSH_STATE.md
 *.safetensors
 weights/
 **/weights/
+
+# ---- Benchmark / diagnostic scratch (2.7G 样本视频 + 临时输出，不入库) ----
+bench/
