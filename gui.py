@@ -873,8 +873,8 @@ class App:
         self.busy = b
         state = "disabled" if b else "normal"
         self.detect_btn.config(state=state if self.video_path else "disabled")
-        if not b:
-            self.export_btn.config(state="normal" if self.scenes else "disabled")
+        # 导出进行中也要把「导出视频」按钮置灰，避免用户重复点击
+        self.export_btn.config(state=state if self.scenes else "disabled")
 
 
 def _crash(tb_text):
