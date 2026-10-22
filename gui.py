@@ -1,10 +1,12 @@
 """GUI for the video ad-removal tool (tkinter)."""
+import base64
 import os
 import queue
 import re
 import shutil
 import threading
 import tkinter as tk
+from collections import OrderedDict
 from tkinter import filedialog, messagebox, ttk
 
 import utils
@@ -27,11 +29,24 @@ _VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".m4v",
 # "codec not supported in container" 之类的失败。
 _OUT_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
 
-# 预览缩略图的像素宽（_load_thumb_image 里固定缩放到这个宽）；
+# 预览缩略图的像素宽（_encode_png 里固定缩放到这个宽）；
 # 一行能放几张 = 画布可用宽 // 单张卡片估算宽。卡片由「缩略图宽 + 左右内边距 +
 # LabelFrame 边框」组成，下面留一点余量避免最右边一张被滚动条压住。
 _THUMB_W = 240
+_THUMB_H = 135    # 缩略图显示高度（16:9 与 previewer 的 240x135 一致）
 _CARD_W = _THUMB_W + 28   # 240 缩略图 + 卡片 padx(6*2) + LabelFrame 边框/内边距余量
+
+# ---------- 虚拟化渲染参数（修复「868 张之后卡片空白」） ----------
+# 根因：Windows 每进程 USER 对象（窗口/菜单等）上限 10000，而每张卡片
+# ≈4 个 USER 对象（LabelFrame + 缩略图 Label + 信息 Label + Checkbutton）。
+# 2913 段全量渲染 ≈11650 个，超限后 Tk **静默**绘制失败——不报错，界面
+# 从第 ~868 张起纯白。修复：卡片池 + 滚动重绑定，USER 占用与段数彻底解耦。
+_ROW_GAP = 12           # 行间距（与原 pady=6*2 一致）
+_COL_GAP = 12           # 列间距（与原 padx=6*2 一致）
+_ROW_BUF = 2            # 可见区域上下各多渲染的缓冲行
+_IMG_CACHE_MAX = 200    # PhotoImage LRU 上限（每个 ≈130KB 内存 + 1 个 GDI 句柄）
+_PNG_CACHE_MAX = 3000   # 后台解码后的 PNG bytes 缓存上限（≈25KB/个；
+                        # 覆盖 2913 段的真实场景，导出后回看仍不缺图）
 
 
 def _fmt_export_status(frac, status, total_kept):
@@ -86,7 +101,6 @@ class App:
         self.full_probe = None
         self.scenes = []
         self.vars = []
-        self.thumb_imgs = []
         self._sel_anchor = None     # Shift 范围多选的锚点（片段下标）
         self.q = queue.Queue()
         self.busy = False
@@ -94,7 +108,44 @@ class App:
         self.encoder = merger.pick_encoder()
         self.output_dir = _OUTPUT_DIR
 
+        # ---------- 虚拟化渲染状态 ----------
+        # 卡片池：只有「可见行 + 缓冲行」数量的卡片常驻画布，滚动时把池卡片
+        # 重新绑定到新可见的场景（改文字/复选框变量/缩略图），段数再多 USER
+        # 对象也只等于池大小（约百来个）。
+        self._pool = []                # [{frame,thumb,info,cb,win,scene,img_idx}]
+        self._cols = 0                 # 当前每行卡片数
+        self._card_h = 0               # 统一卡片高度（量出来的，保证行距精确）
+        self._row_pitch = 0            # 行高（_card_h + _ROW_GAP）
+        self._rows_total = 0
+        self._canvas_w = 0
+        self._view_first = 0           # 当前可见的首个场景下标
+        self._view_last = -1           # 当前可见的末个场景下标
+        self._last_yview = None        # 上次轮询到的滚动位置
+        # 缩略图两级缓存：后台线程只做「PIL 解码 -> PNG bytes」（_png_cache），
+        # 主线程再把 bytes 变成 PhotoImage（_img_cache）贴上卡片。
+        # ⚠️ Tk 对象只能在主线程创建，这是铁律——故拆成两级。
+        self._img_cache = OrderedDict()      # 场景下标 -> PhotoImage
+        self._png_cache = OrderedDict()      # 场景下标 -> PNG bytes
+        self._png_inflight = set()           # 后台正在解码的下标
+        self._png_lock = threading.Lock()
+        self._png_queue = queue.Queue()
+        self._decode_gen = 0                 # 代际标记：换视频后作废旧任务
+        # 占位图（缩略图未就绪时显示，保证卡片尺寸不跳）
+        self._blank_img = tk.PhotoImage(width=_THUMB_W, height=_THUMB_H)
+        try:
+            self._blank_img.put("#3c3c3c",
+                                to=(0, 0, _THUMB_W - 1, _THUMB_H - 1))
+        except Exception:
+            pass
+        self._dummy_var = tk.IntVar(value=0)  # 停放卡片的复选框变量
+
         self._build()
+        # 后台解码线程（整个进程生命周期内常驻，只消费队列）
+        threading.Thread(target=self._png_worker_loop, daemon=True).start()
+        # 滚动/缓存轮询：Tk 没有「视图变化」事件，轮询 yview 是最稳的做法
+        self.root.after(60, self._view_tick)
+        # 显卡信息放后台探测（nvidia-smi 有几百毫秒延迟），不拖慢启动
+        self._refresh_gpu_label()
 
     # ---------- UI construction ----------
     def _build(self):
@@ -125,7 +176,10 @@ class App:
         # 注册拖放：把视频文件拖入输入框或整个窗口即可加载
         self._setup_dnd()
 
-        # Segment area (scrollable)
+        # Segment area (scrollable, 虚拟化渲染)
+        # 不再用「一个 Frame 装下全部卡片」——那个 Frame 的子控件数就是
+        # USER 对象数，几千段必爆 10000 上限（表现为 868 张后空白）。
+        # 现在画布上只放一池复用卡片，按可见区域绝对定位、滚动时重绑定。
         mid = ttk.Frame(self.root)
         mid.pack(fill="both", expand=True, padx=8, pady=4)
         self.canvas = tk.Canvas(mid, bg="#fafafa")
@@ -134,11 +188,8 @@ class App:
         self.canvas.configure(yscrollcommand=self.scroll.set)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scroll.pack(side="right", fill="y")
-        self.inner = ttk.Frame(self.canvas)
-        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.inner.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        # 画布尺寸变化（窗口最大化/手动缩放）→ 重算列数、重排池卡片
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         # 鼠标滚轮滚动（画布区域内的滚轮才生效，避免干扰其它控件）
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind_all("<Button-4>", self._on_mousewheel)  # Linux 上滚
@@ -183,8 +234,31 @@ class App:
         ttk.Label(self.root, textvariable=self.status_var, foreground="#333").pack(
             fill="x", padx=8, pady=(0, 6))
 
-        enc_name = "GPU (NVENC)" if self.encoder == "h264_nvenc" else "CPU (libx264)"
-        self.info_var.set(f"编码器: {enc_name}    CUDA 13.1 / RTX 2060 兼容")
+    def _refresh_gpu_label(self):
+        """后台探测显卡名称并更新信息栏（不阻塞启动；探测失败不打扰用户）。"""
+        def work():
+            txt = "编码器: CPU (libx264)（未检测到 NVIDIA 显卡）"
+            try:
+                import subprocess
+                kwargs = {"capture_output": True, "text": True, "timeout": 4}
+                if os.name == "nt":
+                    kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    **kwargs)
+                if out.returncode == 0 and out.stdout.strip():
+                    name = out.stdout.strip().splitlines()[0].strip()
+                    enc = ("GPU (NVENC)" if self.encoder == "h264_nvenc"
+                           else "CPU (libx264)")
+                    txt = f"编码器: {enc}    显卡: {name}"
+            except Exception:
+                pass
+            try:
+                self.q.put(("gpu_label", txt))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------- window state ----------
     def _zoom_window(self):
@@ -410,9 +484,9 @@ class App:
             pass
 
     def _thumb_progress(self, i, n):
-        """缩略图生成进度（后台线程调用）。"""
+        """缩略图生成进度（后台线程调用，只入队不碰 Tk）。"""
         try:
-            frac = 1.0
+            frac = (i / n) if n else 0.0
             self.q.put(("progress", frac, f"正在生成预览缩略图… {i}/{n}"))
         except Exception:
             pass
@@ -496,8 +570,16 @@ class App:
         total_kept = len(kept)
         # 先把「保留 N 段」总览推到主线程，免得 merger 首个回调前状态栏空白
         self.q.put(("status_only", f"开始导出：共保留 {total_kept} 段视频…"))
+        _last = [0.0]
+
         def cb(frac, status):
-            self.q.put(("progress", frac, _fmt_export_status(frac, status, total_kept)))
+            # 单调钳制：路线回退（lossless 失败 → smartcut 重试、或重建索引
+            # 重试）会让 merger 的进度从 0 重新计，不加这道闸进度条会肉眼
+            # 回跳。仅作用于本次导出，不影响检测/缩略图阶段各自归零。
+            if frac > _last[0]:
+                _last[0] = frac
+            self.q.put(("progress", _last[0],
+                        _fmt_export_status(_last[0], status, total_kept)))
         ok, msg = False, "未知错误"
         try:
             # 默认「无损」：切点对齐关键帧 + 全程 -c copy（零重编码）；
@@ -535,8 +617,9 @@ class App:
     def _cleanup_thumbs(self):
         """导出完成后删除 output/thumbs 里的缩略图。
 
-        界面上的缩略图早已以 PNG 数据载入内存（self.thumb_imgs），删除磁盘
-        上的 jpg 不会影响已显示的卡片，也不动 output 下的其它文件。
+        界面上的缩略图早已以 PNG 数据载入内存（self._png_cache /
+        self._img_cache），删除磁盘上的 jpg 不会影响已显示的卡片，
+        也不动 output 下的其它文件。
         """
         thumb_dir = os.path.join(self.output_dir, "thumbs")
         try:
@@ -557,11 +640,13 @@ class App:
         for v in self.vars:
             v.set(1)
         self._refresh_target()
+        self._refresh_highlights()
 
     def _sel_none(self):
         for v in self.vars:
             v.set(0)
         self._refresh_target()
+        self._refresh_highlights()
 
     # ---------- rendering ----------
     def _on_mousewheel(self, event):
@@ -580,148 +665,381 @@ class App:
         return "break"
 
     def _reset(self):
-        for w in list(self.inner.children.values()):
-            w.destroy()
+        """清空当前视频的片段视图（池卡片保留复用，只是全部撤下屏幕）。"""
+        self._park_all()
         self.scenes = []
         self.vars = []
-        self.thumb_imgs = []
+        self._img_cache.clear()
+        with self._png_lock:
+            self._png_cache.clear()
+            self._png_inflight.clear()
+        self._decode_gen += 1          # 作废后台还没跑完的解码任务
+        self._view_first, self._view_last = 0, -1
+        self._last_yview = None
+        try:
+            self.canvas.configure(scrollregion=(0, 0, 1, 1))
+            self.canvas.yview_moveto(0)
+        except Exception:
+            pass
         self.export_btn.config(state="disabled")
         self.target_var.set("目标规格: 勾选“保留”的片段将按顺序拼接；"
                             "最终视频按主体视频(保留片段的最后一段)的分辨率/帧率导出。")
 
     def _render_segments(self):
-        for w in list(self.inner.children.values()):
-            w.destroy()
-        self.thumb_imgs = []
-        # ⚠️ 必须一并清空 vars：_add_card 会往里 append，若不清空，
-        # 二次检测后 vars 会变成 2N 个，而 export 取的是 vars[0:N]
-        # —— 用的是【上一轮】的勾选状态，导致"取消勾选没生效"。
-        self.vars = []
+        """把检测结果渲染成卡片网格（虚拟化：O(池大小)，与段数无关）。
+
+        ⚠️ vars 必须整表重建：二次检测后场景数会变，若沿用旧表，
+        export 取的 vars[0:N] 会是上一轮的勾选状态（"取消勾选没生效" bug）。
+        """
+        self.vars = [tk.IntVar(value=1) for _ in self.scenes]
         self._sel_anchor = None     # 旧下标已失效，锚点必须一起清
-        cols = self._compute_cols()
-        for idx, sc in enumerate(self.scenes):
-            self._add_card(idx, sc, cols)
+        self._img_cache.clear()
+        with self._png_lock:
+            self._png_cache.clear()
+            self._png_inflight.clear()
+        self._decode_gen += 1
+        self._view_first, self._view_last = 0, -1
+        self._last_yview = None
+        try:
+            self.canvas.yview_moveto(0)     # 新结果从头看起
+        except Exception:
+            pass
+        self._layout_visible(force=True)
         self._refresh_target()
 
-    def _compute_cols(self):
-        """按当前窗口宽度决定每行缩略图张数。
+    # ---------- 虚拟化渲染：卡片池 ----------
+    def _measure_card(self):
+        """量一张标准卡片的高度（缩略图 240x135 + 3 行信息 + 复选框）。
 
-        窗口已最大化时画布宽≈屏幕宽(减滚动条/边距)，据此一行能放
-        (画布宽 // 单卡估算宽) 张；至少为 1。画布尚未布局好(宽<=1)时
-        退回到屏幕宽度估算，保证「检测转场」后首次渲染就有合理列数。
+        所有卡片必须是同一高度，虚拟滚动的行距才能按像素精确算；
+        信息区恒渲染 3 行（分辨率缺失时用占位符），高度才稳定。
         """
-        try:
-            w = self.canvas.winfo_width()
-        except Exception:
-            w = 0
-        if w <= 1:
-            try:
-                w = self.root.winfo_screenwidth()
-            except Exception:
-                w = 0
-        if w <= 1:
-            return 3     # 实在拿不到宽度时的保守默认
-        return max(1, max(3, w // _CARD_W))  # 至少 3 列，避免小窗反而更少
-
-    def _load_thumb_image(self, thumb):
-        """把缩略图解码/缩放后转成 Tk 原生 PhotoImage。
-
-        改用「PIL 解码+缩放 -> PNG bytes -> tk.PhotoImage(data=...)」的方式，
-        彻底绕开 Pillow 的 ImageTk._imagingtk DLL——该 DLL 在本机会被
-        「应用程序控制策略」拦截导致加载失败（表现为“预览生成失败”）。
-        Tk 8.6 自带 PNG 解码器，因此这条路径不依赖任何被封的 DLL。
-        """
-        import io
-        import base64
-        from PIL import Image
-        with Image.open(thumb) as im:
-            im = im.convert("RGB").resize((_THUMB_W, int(_THUMB_W * 135 / 240)))
-            buf = io.BytesIO()
-            im.save(buf, format="PNG")
-        data = base64.b64encode(buf.getvalue())
-        return tk.PhotoImage(data=data)
-
-    def _add_card(self, idx, sc, cols):
-        f = ttk.LabelFrame(self.inner, text=f"段 {idx + 1}")
-        r, c = divmod(idx, cols)
-        f.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
-        self.inner.columnconfigure(c, weight=1)
-
-        thumb = sc.get("thumb")
-        if thumb and os.path.isfile(thumb):
-            try:
-                img = self._load_thumb_image(thumb)
-                lbl = tk.Label(f, image=img, bg="#222")
-                lbl.image = img
-                self.thumb_imgs.append(img)
-            except Exception:
-                lbl = tk.Label(f, text="(预览生成失败)", width=30, height=8)
-        else:
-            lbl = tk.Label(f, text="(无预览)", width=30, height=8)
+        proto = ttk.LabelFrame(self.canvas, text="段 1")
+        lbl = tk.Label(proto, image=self._blank_img, bg="#222")
+        lbl.image = self._blank_img
         lbl.grid(row=0, column=0, pady=2)
+        ttk.Label(proto, text="0:00:00 → 0:00:00\n时长 0.0s\n1920×1080",
+                  justify="left").grid(row=1, column=0, sticky="w", padx=4)
+        ttk.Checkbutton(proto, text="保留（取消=删除）").grid(
+            row=2, column=0, sticky="w", padx=4, pady=2)
+        try:
+            self.root.update_idletasks()
+            h = proto.winfo_reqheight()
+        except Exception:
+            h = 0
+        proto.destroy()
+        return h if h and h > 1 else 240
 
+    def _make_card(self):
+        """建一张池卡片。结构固定，之后只重绑定内容，绝不重建。"""
+        f = ttk.LabelFrame(self.canvas, text="段 1")
+        f.grid_propagate(False)      # 尺寸由我们按网格精确指定
+        thumb = tk.Label(f, image=self._blank_img, bg="#222")
+        thumb.image = self._blank_img
+        thumb.grid(row=0, column=0, pady=2)
+        info = ttk.Label(f, text="", justify="left")
+        info.grid(row=1, column=0, sticky="w", padx=4)
+        cb = ttk.Checkbutton(f, text="保留（取消=删除）",
+                             variable=self._dummy_var,
+                             command=self._on_card_cb)
+        cb.grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        win = self.canvas.create_window((-9999, -9999), window=f, anchor="nw")
+        card = {"frame": f, "thumb": thumb, "info": info, "cb": cb,
+                "win": win, "scene": -1, "img_idx": -1}
+
+        # 点击缩略图切换保留/删除（Shift = 区间批量）。闭包绑定池槽位 i——
+        # 池只增不减，槽位下标永久有效。
+        def on_click(event, i=len(self._pool)):
+            self._card_click(i, event)
+
+        thumb.bind("<Button-1>", on_click)
+        thumb.config(cursor="hand2")  # 提示可点击
+        return card
+
+    def _bind_card(self, i, idx):
+        """把第 i 张池卡片绑定到场景 idx（就地更新内容，不新建控件）。"""
+        card = self._pool[i]
+        if card["scene"] == idx:
+            return
+        sc = self.scenes[idx]
+        card["frame"].configure(text=f"段 {idx + 1}")
         info = (f"{utils.human_time(sc['start'])} → {utils.human_time(sc['end'])}\n"
                 f"时长 {sc['duration']:.1f}s")
-        if sc.get("frame_w"):
-            info += f"\n{sc['frame_w']}×{sc['frame_h']}"
-        ttk.Label(f, text=info, justify="left").grid(row=1, column=0, sticky="w", padx=4)
+        fw, fh = sc.get("frame_w"), sc.get("frame_h")
+        info += f"\n{fw}×{fh}" if fw else "\n–×–"
+        card["info"].configure(text=info)
+        card["cb"].configure(variable=self.vars[idx])
+        card["scene"] = idx
+        self._apply_thumb(i, idx)
 
-        var = tk.IntVar(value=1)
-        self.vars.append(var)
-        # 点击截图即可切换“保留”复选框状态（带选中高亮反馈）；
-        # 按住 Shift 点击第二张 = 把锚点到这张之间的所有片段统一置为锚点的状态
-        self._bind_thumb_toggle(lbl, var, idx)   # 必须在 var 定义之后调用
-        cb = ttk.Checkbutton(f, text="保留（取消=删除）", variable=var,
-                              command=self._refresh_target)
-        cb.grid(row=2, column=0, sticky="w", padx=4, pady=2)
+    def _apply_thumb(self, i, idx):
+        """贴缩略图：内存里已有 PhotoImage 就立即贴，否则显示占位图。"""
+        card = self._pool[i]
+        img = self._img_cache.get(idx)
+        if img is not None:
+            self._img_cache.move_to_end(idx)     # LRU：刚用过，挪到队尾
+            card["thumb"].configure(image=img, text="")
+            card["thumb"].image = img
+            card["img_idx"] = idx
+        else:
+            card["thumb"].configure(image=self._blank_img, text="")
+            card["thumb"].image = self._blank_img
+            card["img_idx"] = -1
+        self._highlight_card(i)
 
+    def _park_card(self, i):
+        """把池卡片 i 撤下屏幕（移到画布外、解绑场景，控件保留复用）。"""
+        card = self._pool[i]
+        if card["scene"] == -1:
+            return
+        card["scene"] = -1
+        card["img_idx"] = -1
+        try:
+            card["cb"].configure(variable=self._dummy_var)
+        except Exception:
+            pass
+        card["thumb"].configure(image=self._blank_img, text="")
+        card["thumb"].image = self._blank_img
+        try:
+            self.canvas.coords(card["win"], -9999, -9999)
+        except Exception:
+            pass
 
-    def _bind_thumb_toggle(self, lbl, var, idx):
-        """点击缩略图切换“保留/删除”；按住 Shift 可批量处理一个连续区间。
+    def _park_all(self):
+        for i in range(len(self._pool)):
+            self._park_card(i)
+
+    def _layout_visible(self, force=False):
+        """按当前滚动位置/画布尺寸，把池卡片重绑定到可见场景。
+
+        虚拟化的核心：USER 对象只有池里这几十张，与段数彻底无关。
+        force=True 时无视「范围没变」的短路，重算列数/滚动区/定位。
+        """
+        if not self.scenes:
+            self._park_all()
+            try:
+                self.canvas.configure(scrollregion=(0, 0, 1, 1))
+            except Exception:
+                pass
+            return
+        cw = self.canvas.winfo_width()
+        if cw <= 1:
+            try:
+                cw = self.root.winfo_screenwidth()
+            except Exception:
+                cw = 1280
+        cols = max(1, max(3, cw // _CARD_W))     # 至少 3 列（与原实现一致）
+        rows_total = (len(self.scenes) + cols - 1) // cols
+        if (force or cols != self._cols or not self._pool
+                or rows_total != self._rows_total):
+            if not self._card_h:
+                self._card_h = self._measure_card()
+                self._row_pitch = self._card_h + _ROW_GAP
+            self._cols = cols
+            self._rows_total = rows_total
+            try:
+                self.canvas.configure(
+                    scrollregion=(0, 0, cw, rows_total * self._row_pitch))
+            except Exception:
+                pass
+        try:
+            y0 = self.canvas.canvasy(0)
+            ch = self.canvas.winfo_height()
+        except Exception:
+            y0, ch = 0.0, 0.0
+        pitch = self._row_pitch or 1
+        first_row = max(0, int(y0 // pitch) - _ROW_BUF)
+        last_row = min(rows_total - 1, int((y0 + ch) // pitch) + _ROW_BUF)
+        first_idx = first_row * cols
+        last_idx = min(len(self.scenes) - 1, (last_row + 1) * cols - 1)
+        if (not force and first_idx == self._view_first
+                and last_idx == self._view_last):
+            return
+        self._view_first, self._view_last = first_idx, last_idx
+        need = last_idx - first_idx + 1
+        while len(self._pool) < need:
+            self._pool.append(self._make_card())
+        col_w = max(1, cw // cols)
+        card_w = max(1, col_w - _COL_GAP)
+        for i, card in enumerate(self._pool):
+            if i < need:
+                self._bind_card(i, first_idx + i)
+                r, c = divmod(first_idx + i, cols)
+                try:
+                    self.canvas.coords(card["win"], c * col_w + _COL_GAP // 2,
+                                       r * pitch + _ROW_GAP // 2)
+                except Exception:
+                    pass
+            else:
+                self._park_card(i)
+            card["frame"].configure(width=card_w, height=self._card_h)
+        self._prefetch(first_idx, last_idx)
+        self._pump_images()
+
+    def _on_canvas_configure(self, event):
+        """画布尺寸变化（窗口最大化/缩放）→ 重算列数并重排。"""
+        w = self.canvas.winfo_width()
+        if w > 1 and w != self._canvas_w:
+            self._canvas_w = w
+            self._layout_visible(force=True)
+
+    def _view_tick(self):
+        """轮询重布局 + 贴图（Tk 没有 view-changed 事件，轮询最稳）。"""
+        try:
+            if self.scenes:
+                frac = self.canvas.yview()
+                if frac != self._last_yview:
+                    self._last_yview = frac
+                    self._layout_visible()
+                self._pump_images()
+        except Exception:
+            pass
+        self.root.after(60, self._view_tick)
+
+    # ---------- 缩略图两级缓存（后台解码 → 主线程成像） ----------
+    def _encode_png(self, thumb):
+        """PIL 解码 + 缩放 -> PNG bytes（后台线程调用，不碰任何 Tk 对象）。
+
+        绕开 Pillow 的 ImageTk._imagingtk DLL——该 DLL 在本机会被
+        「应用程序控制策略」拦截；Tk 8.6 自带 PNG 解码器，无此问题。
+        """
+        import io
+        from PIL import Image
+        with Image.open(thumb) as im:
+            im = im.convert("RGB").resize((_THUMB_W, _THUMB_H))
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _prefetch(self, first, last):
+        """把可见区（外加前后缓冲）的缩略图解码任务投给后台线程。"""
+        if not self.scenes:
+            return
+        lo = max(0, first - 8)
+        hi = min(len(self.scenes) - 1, last + 16)
+        with self._png_lock:
+            want = [i for i in range(lo, hi + 1)
+                    if i not in self._png_cache and i not in self._png_inflight]
+            self._png_inflight.update(want)
+        if want:
+            self._png_queue.put((self._decode_gen, want))
+
+    def _png_worker_loop(self):
+        """后台解码线程（常驻）：PIL -> PNG bytes 入缓存。
+
+        绝不在这里创建 PhotoImage——Tk 对象只能在主线程创建。
+        代际标记（_decode_gen）变化说明换视频了，剩余任务直接作废。
+        """
+        while True:
+            item = self._png_queue.get()
+            if item is None:
+                return
+            gen, idxs = item
+            for i in idxs:
+                if self._decode_gen != gen:
+                    break
+                sc = self.scenes[i] if 0 <= i < len(self.scenes) else None
+                p = (sc or {}).get("thumb")
+                data = None
+                try:
+                    if p and os.path.isfile(p):
+                        data = self._encode_png(p)
+                except Exception:
+                    data = None
+                with self._png_lock:
+                    self._png_inflight.discard(i)
+                    if data is not None and self._decode_gen == gen:
+                        self._png_cache[i] = data
+                        while len(self._png_cache) > _PNG_CACHE_MAX:
+                            self._png_cache.popitem(last=False)
+            try:
+                self.q.put(("pump",))     # 叫主线程来成像
+            except Exception:
+                pass
+
+    def _pump_images(self):
+        """主线程：把已解码的 PNG bytes 变成 PhotoImage 贴上卡片。"""
+        for i, card in enumerate(self._pool):
+            idx = card["scene"]
+            if idx is None or idx < 0 or card["img_idx"] == idx:
+                continue
+            with self._png_lock:
+                data = self._png_cache.get(idx)
+            if data is None:
+                continue
+            try:
+                img = tk.PhotoImage(data=base64.b64encode(data))
+            except Exception:
+                card["img_idx"] = idx      # 这张放弃了，别反复重试
+                continue
+            self._img_cache[idx] = img
+            self._img_cache.move_to_end(idx)
+            while len(self._img_cache) > _IMG_CACHE_MAX:
+                self._img_cache.popitem(last=False)
+            card["thumb"].configure(image=img, text="")
+            card["thumb"].image = img
+            card["img_idx"] = idx
+            self._highlight_card(i)
+
+    # ---------- 选中高亮与交互 ----------
+    def _highlight_card(self, i):
+        """选中(保留)的片段：缩略图描鲜红粗框（与原实现一致）。"""
+        card = self._pool[i]
+        idx = card["scene"]
+        if idx is None or idx < 0 or idx >= len(self.vars):
+            return
+        try:
+            on = self.vars[idx].get() == 1
+            card["thumb"].config(relief="solid" if on else "flat",
+                                 highlightthickness=4 if on else 0,
+                                 highlightbackground="#ff0000",
+                                 highlightcolor="#ff0000")
+        except Exception:
+            pass
+
+    def _refresh_highlights(self):
+        for i in range(len(self._pool)):
+            self._highlight_card(i)
+
+    def _on_card_cb(self):
+        """池卡片的复选框被用户点击（命令回调只在主线程执行）。"""
+        self._refresh_target()
+        self._refresh_highlights()
+
+    def _card_click(self, i, event):
+        """点缩略图切换“保留/删除”；Shift + 点 = 批量处理连续区间。
 
         交互（与文件管理器一致）：
           · 普通点击 —— 切换这一张，同时把它设为**锚点**；
           · Shift + 点击 —— 把「锚点 → 当前这张」之间（含两端）的所有片段
-            统一置为**锚点当前的状态**。所以「Shift 点第一张把它取消，
-            再 Shift 点最后一张」= 整段区间全部取消选中；反过来先 Shift 点
-            一张未选中的，再 Shift 点另一张，则整段区间全部选中。
-          · 一次区间操作完成后锚点清空，下次 Shift 点击重新起锚，避免
-            上一次的锚点把新区间拉长。
+            统一置为**锚点当前的状态**；
+          · 一次区间操作完成后锚点清空，下次 Shift 点击重新起锚。
         """
-        def on_click(event):
-            # event.state 的 bit0 = Shift（Tk 通用掩码，Windows/Linux 一致）
-            shift = bool(getattr(event, "state", 0) & 0x0001)
-            anchor = getattr(self, "_sel_anchor", None)
-            if shift and anchor is not None and anchor != idx \
-                    and 0 <= anchor < len(self.vars):
-                target = self.vars[anchor].get()
-                lo, hi = (anchor, idx) if anchor < idx else (idx, anchor)
-                for i in range(lo, hi + 1):
-                    self.vars[i].set(target)
-                # 区间已应用，清锚点；否则下次 Shift 点击会从旧锚点一路拉过来
-                self._sel_anchor = None
-                n = hi - lo + 1
-                self.status_var.set(
-                    f"已{'选中' if target else '取消'}第 {lo + 1}–{hi + 1} 段"
-                    f"（共 {n} 段）")
-            else:
-                var.set(0 if var.get() else 1)
-                self._sel_anchor = idx
-            self._refresh_target()
-        lbl.bind("<Button-1>", on_click)
-        lbl.config(cursor="hand2")  # 提示可点击
-        def reflect(*_args):
-            try:
-                on = var.get() == 1
-                # 选中(保留)的片段截图：鲜红色粗框围起来，方便识别
-                lbl.config(relief="solid" if on else "flat",
-                           highlightthickness=4 if on else 0,
-                           highlightbackground="#ff0000",
-                           highlightcolor="#ff0000")
-            except Exception:
-                pass
-        var.trace_add("write", reflect)
-        reflect()  # 初始化边框状态
+        card = self._pool[i] if 0 <= i < len(self._pool) else None
+        idx = card["scene"] if card else -1
+        if idx is None or idx < 0 or idx >= len(self.vars):
+            return
+        # event.state 的 bit0 = Shift（Tk 通用掩码，Windows/Linux 一致）
+        shift = bool(getattr(event, "state", 0) & 0x0001)
+        anchor = getattr(self, "_sel_anchor", None)
+        if shift and anchor is not None and anchor != idx \
+                and 0 <= anchor < len(self.vars):
+            target = self.vars[anchor].get()
+            lo, hi = (anchor, idx) if anchor < idx else (idx, anchor)
+            for k in range(lo, hi + 1):
+                self.vars[k].set(target)
+            # 区间已应用，清锚点；否则下次 Shift 点击会从旧锚点一路拉过来
+            self._sel_anchor = None
+            n = hi - lo + 1
+            self.status_var.set(
+                f"已{'选中' if target else '取消'}第 {lo + 1}–{hi + 1} 段"
+                f"（共 {n} 段）")
+        else:
+            var = self.vars[idx]
+            var.set(0 if var.get() else 1)
+            self._sel_anchor = idx
+        self._refresh_target()
+        self._refresh_highlights()
 
     def _refresh_target(self):
         if not self.scenes:
@@ -827,21 +1145,33 @@ class App:
     def _handle_item(self, item):
         kind = item[0]
         if kind == "detected":
-            self.scenes = item[1]
-            self._render_segments()
-            self.export_btn.config(state="normal")
-            method = detector.get_last_method()
-            method_txt = {"gpu": "GPU 硬解", "cpu": "CPU 软解",
-                          "opencv": "OpenCV 兜底"}.get(method, method)
-            detail = detector.get_last_detail()
-            self.status_var.set(
-                f"检测到 {len(self.scenes)} 段（{method_txt}）。"
-                + (f"　[降级原因: {detail}]" if detail else "")
-                + "点预览图切换保留/删除，按住 Shift 点两张可批量处理中间所有片段；"
-                  "然后点击“导出视频”（输出文件名自动生成）。")
-            self._set_busy(False)
+            # or [] 兜底：worker 异常路径也可能塞 None，绝不能把 None
+            # 留在 self.scenes 里（后续每个遍历点都会炸）。
+            self.scenes = item[1] or []
+            # ⚠️ try/finally：渲染阶段一旦抛异常，也必须把 busy 复位、
+            # 按钮放行，否则界面永远"吊死"且所有按钮点不动。
+            try:
+                self._render_segments()
+                if self.scenes:
+                    self.export_btn.config(state="normal")
+                method = detector.get_last_method()
+                method_txt = {"gpu": "GPU 硬解", "cpu": "CPU 软解",
+                              "opencv": "OpenCV 兜底"}.get(method, method)
+                detail = detector.get_last_detail()
+                self.status_var.set(
+                    f"检测到 {len(self.scenes)} 段（{method_txt}）。"
+                    + (f"　[降级原因: {detail}]" if detail else "")
+                    + "点预览图切换保留/删除，按住 Shift 点两张可批量处理中间所有片段；"
+                      "然后点击“导出视频”（输出文件名自动生成）。")
+            finally:
+                self._set_busy(False)
             # 后台预热关键帧表，供无损模式"预计少保留多少秒"的提示使用
             self._warm_keyframes()
+        elif kind == "pump":
+            # 后台解码完一批缩略图，主线程成像
+            self._pump_images()
+        elif kind == "gpu_label":
+            self.info_var.set(item[1])
         elif kind == "kf_ready":
             self.kf_ready = True
             self._refresh_target()

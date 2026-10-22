@@ -1,4 +1,4 @@
-"""转场检测 —— ffmpeg 加速版（GPU 可用时自动走 NVDEC + GPU 降采样）。
+"""转场检测 —— ffmpeg 加速版（默认 CPU 软解，GPU 硬解作一级回退）。
 
 判定逻辑沿用 scdet 滤镜自带的阈值（相邻帧差异，与原 OpenCV 帧差思路一致）：
 scdet 只在**真正判定为转场**的帧上，把 ``lavfi.scd.score`` 与
@@ -44,9 +44,16 @@ ffmpeg 会自动插入 hwdownload **把整幅 1080p 帧搬回内存**，这一�
 本机原驱动 591.74 时，nvidia-smi 虽显示支持 CUDA 13.1，但自带 nightly
 ffmpeg（2026-07-13 编）所需的 NVENC/NVDEC SDK 版本超前于驱动，导致 NVENC
 硬件编码（Function not implemented）与老的 h264_cuvid 解码器（cuvid decode
-callback error）失效。升级到驱动 610.74 后恢复正常。本模块检测阶段优先用
-``-hwaccel cuda``（现代 nvdec 路径）GPU 硬解，失败回退软件 ffmpeg，再失败
-回退原 OpenCV 实现，保证 GUI 永远有结果。
+callback error）失效。升级到驱动 610.74 后恢复正常。
+
+2026-10-21 路径重排：CPU 软解优先
+----------------------------------
+实测 realistic_cuts.mp4（150s 1080p30）：``-hwaccel cuda`` + scale_cuda
+6.41s vs 纯 CPU 软解 + scale 3.65s，**检测结果完全一致**（10 段同切点）。
+原因是 NVDEC native 通路每帧有 CUDA 同步开销（≈703fps），而纯软解
+≈1590fps；≤1080p 源根本喂不饱 GPU。故降级链改为
+**CPU → GPU → OpenCV**（4K+ 源可改回 GPU 优先，届时解码压力才真正
+落在 GPU 一侧）。原「GPU 优先」的实测数据仍记录在此，供换机器后复测。
 
 API 与原 detect_scenes 完全一致，可作为 drop-in 替换；任意一步失败都会
 自动回退到原 OpenCV 实现。
@@ -168,8 +175,9 @@ def _try_ffmpeg(path, threshold, min_scene_len, progress_cb, hwaccel=False,
       从 0 增长到总帧数，正好当作"扫描进度"；每个切点以
       `lavfi.scd.time: N`(秒) 实时打到 stderr，直接收集即可。
 
-    hwaccel=True 时走 GPU 硬解 + GPU 降采样（最快）；hwaccel=False 为
-    纯 CPU 软解 + 降采样。两者检测结果一致（实测打分误差 <1%），仅速度不同。
+    hwaccel=True 时走 GPU 硬解 + GPU 降采样；hwaccel=False 为纯 CPU
+    软解 + 降采样（**当前默认首选**，≤1080p 实测更快，见模块头 2026-10-21
+    路径重排）。两者检测结果一致（实测打分误差 <1%），仅速度不同。
 
     threshold: scdet 阈值(0~100)，越小越灵敏。默认 10 对硬切较敏感、
     平滑视频误报为 0；软切/淡入淡出可调到 20~40。
@@ -267,9 +275,10 @@ def _try_ffmpeg(path, threshold, min_scene_len, progress_cb, hwaccel=False,
                 _consume(raw)
 
     if hard_timeout is None:
-        # GPU 实测 ~60x 实时，取 duration/10 已很宽松；CPU 软解 ~10x，取 /3
-        hard_timeout = (max(180.0, duration / 10.0) if hwaccel
-                        else max(300.0, duration / 3.0))
+        # CPU 是现在的首选路径（软解 ≈10x 实时，取 /3 已很宽松）；
+        # GPU 通路 ≈60x 实时，取 /10。两者都至少保留下限，防短视频误杀。
+        hard_timeout = (max(300.0, duration / 3.0) if not hwaccel
+                        else max(180.0, duration / 10.0))
 
     t = threading.Thread(target=_pump, daemon=True)
     t.start()
@@ -333,14 +342,23 @@ def detect_scenes(path, threshold=10, min_scene_len=8, progress_cb=None,
                   sample_w=_SAMPLE_W, sample_h=_SAMPLE_H, status_cb=None):
     """检测场景边界。
 
-    优先用 ffmpeg（GPU 硬解 + GPU 降采样，或 CPU 软解 + 降采样）+ scdet
-    场景检测；任意失败回退到原 OpenCV 逐帧实现。返回
+    优先用 ffmpeg（CPU 软解 + GPU 降采样回退链）+ scdet 场景检测；
+    任意失败回退到原 OpenCV 逐帧实现。返回
     [{start, end, duration}, ...] 连续覆盖整段。
+
+    路径顺序（2026-10-21 实测定序，realistic_cuts.mp4 1080p30）：
+      1. CPU 软解 + scale 降采样 —— **3.65s**（默认首选）
+      2. GPU 硬解 + scale_cuda 降采样 —— 6.41s（一级回退）
+      3. OpenCV 逐帧兜底
+    ≤1080p 源 CPU 软解反而更快：纯软解 ≈1590fps，而 -hwaccel cuda 的
+    NVDEC native 通路每帧有 CUDA 同步开销、仅 ≈703fps；且两者检测
+    结果完全一致（同一切点、打分误差 <1%）。4K+ 源可改用 GPU 档
+    （届时回传量/解码压力才真正落在 GPU 一侧）。
 
     threshold: scdet 阈值(0~100)，越小越灵敏。默认 10 对硬切较敏感，
                软切/淡入淡出可调到 20~40；想更灵敏可降到 5。
     status_cb: 可选，(str) -> None。降级时被调用，让 GUI 能实时显示
-               "GPU 路径失败(原因)，正在回退 CPU 软解…"，避免用户在
+               "CPU 路径失败(原因)，正在回退 GPU 硬解…"，避免用户在
                换挡期间以为程序又卡住了。
     """
     global _last_method, _last_detail
@@ -354,18 +372,7 @@ def detect_scenes(path, threshold=10, min_scene_len=8, progress_cb=None,
             except Exception:
                 pass
 
-    # 1) GPU 硬解（现代 nvdec via -hwaccel cuda）+ GPU 降采样（最快）
-    try:
-        scenes = _try_ffmpeg(path, threshold, min_scene_len, progress_cb,
-                             hwaccel=True)
-        _last_method = "gpu"
-        return scenes
-    except Exception as e:
-        _last_method = "gpu(失败)"
-        reasons.append(f"GPU: {e}")
-        _last_detail = "；".join(reasons)
-        _say(f"GPU 硬解未成功（{e}），正在回退 CPU 软解…")
-    # 2) 软件解码 + 降采样
+    # 1) CPU 软解 + 降采样（实测 ≤1080p 最快，且不占显卡）
     try:
         scenes = _try_ffmpeg(path, threshold, min_scene_len, progress_cb,
                              hwaccel=False)
@@ -375,7 +382,18 @@ def detect_scenes(path, threshold=10, min_scene_len=8, progress_cb=None,
         _last_method = "cpu(失败)"
         reasons.append(f"CPU: {e}")
         _last_detail = "；".join(reasons)
-        _say(f"CPU 软解也未成功（{e}），正在回退 OpenCV 逐帧（较慢）…")
+        _say(f"CPU 软解未成功（{e}），正在回退 GPU 硬解…")
+    # 2) GPU 硬解（现代 nvdec via -hwaccel cuda）+ GPU 降采样
+    try:
+        scenes = _try_ffmpeg(path, threshold, min_scene_len, progress_cb,
+                             hwaccel=True)
+        _last_method = "gpu"
+        return scenes
+    except Exception as e:
+        _last_method = "gpu(失败)"
+        reasons.append(f"GPU: {e}")
+        _last_detail = "；".join(reasons)
+        _say(f"GPU 硬解也未成功（{e}），正在回退 OpenCV 逐帧（较慢）…")
     # 3) 兜底：原 OpenCV 逐帧实现
     _last_method = "opencv"
     return _cv2_detect(path, progress_cb=progress_cb,

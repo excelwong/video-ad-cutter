@@ -92,8 +92,15 @@ def probe_video(path):
                 "width": int(_to_float(s.get("width", 0))),
                 "height": int(_to_float(s.get("height", 0))),
                 "fps": fps,
+                # 帧率的有理数形式（如 2997/100）：29.97 片源按浮点 29.97
+                # 算帧号，2 小时长片尾会漂移数帧；用分数可精确对齐 pts。
+                "fps_num": int(_to_float(num)),
+                "fps_den": int(_to_float(den, 1)) or 1,
                 "codec": s.get("codec_name"),
                 "pix_fmt": s.get("pix_fmt"),
+                # 首帧 pts（秒）。不一定为 0（如 0.021354）：帧 i 的 pts
+                # = start_time + i/fps，previewer 算帧号时要减掉它。
+                "start_time": _to_float(s.get("start_time", 0)),
             }
         elif ctype == "audio" and info["audio"] is None:
             info["audio"] = {

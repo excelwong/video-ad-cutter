@@ -26,6 +26,7 @@ lossless 路线把它推到极致：头边界只能向【前】吸附、尾边�
 GPU: tries h264_nvenc first (RTX 2060 / NVENC), and transparently falls
 back to libx264 (CPU) if the GPU encoder is unavailable or errors.
 """
+import bisect
 import datetime
 import json
 import os
@@ -33,6 +34,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from utils import (get_ffmpeg, has_nvenc, probe_video, probe_segment,
                    run_capture)
@@ -275,26 +278,26 @@ def _write_error_log(app_dir, video_path, out_path, msg, kept_scenes):
 
 def _try_copy_cut(ffmpeg, video_path, kept_scenes, out_path,
                   tmp_dir, progress_cb, attempt):
-    """用 -c copy 切割每个保留段 + concat -c copy 拼接。
+    """用 -c copy 切割每个保留段 + concat -c copy 拼接（段间并行）。
 
     返回 (ok, error_msg)。成功时 error_msg 是成功提示；失败时包含失败命令与 ffmpeg stderr。
     """
     total = len(kept_scenes)
-    seg_files = []
+    jobs = []
     for i, seg in enumerate(kept_scenes):
         seg_out = os.path.join(tmp_dir, f"seg_{i:03d}.mp4")
         cmd = [ffmpeg, "-y", "-ss", f"{seg['start']:.3f}", "-i", video_path,
-                "-t", f"{seg['duration']:.3f}", "-c", "copy", seg_out]
-        rc, err = run_capture(cmd,
-                            inactivity_timeout=EXPORT_INACTIVITY_TIMEOUT)
-        if rc != 0 or not os.path.isfile(seg_out) or os.path.getsize(seg_out) == 0:
-            return False, (f"片段 {i + 1}/{total} 流拷贝失败 (attempt={attempt}):\n"
-                            f"命令: {' '.join(cmd)}\n返回码: {rc}\n"
-                            f"{err[-3000:]}")
-        seg_files.append(seg_out)
-        if progress_cb:
-            progress_cb(min(0.95, (i + 1) / total * 0.95),
-                        f"流拷贝片段 {i + 1}/{total}")
+               "-t", f"{seg['duration']:.3f}", "-c", "copy", seg_out]
+        desc = f"片段 {i + 1}/{total} 流拷贝 (attempt={attempt})"
+        jobs.append((i, cmd, seg_out, float(seg["duration"]), desc))
+
+    # copy 段纯 IO，默认 3 路并发；段数 ≤2 时顺序跑
+    workers = _default_workers(None, total)
+    seg_files, fail = _run_jobs_parallel(jobs, workers, progress_cb,
+                                         "流拷贝片段", EXPORT_INACTIVITY_TIMEOUT)
+    if fail:
+        return False, fail
+
     if progress_cb:
         progress_cb(0.97, "合并片段中(原编码)...")
     list_path = os.path.join(tmp_dir, "list.txt")
@@ -505,6 +508,15 @@ def _merge_adjacent(scenes, tol=1e-3):
     return out
 
 
+def _kf_at_or_before(kfs, t):
+    """返回 <= t 的最后一个关键帧；没有则 0.0（文件开头）。
+
+    kfs 升序。bisect 版等价格代原来的 ``max([k for k in kfs if k <= t], default=0.0)``。
+    """
+    i = bisect.bisect_right(kfs, t)
+    return kfs[i - 1] if i > 0 else 0.0
+
+
 def _plan_block(kfs, start, end, tol=_SPLIT_TOL,
                 head_strict=True, tail_strict=True):
     """为一个连续块规划切割方案。
@@ -520,11 +532,15 @@ def _plan_block(kfs, start, end, tol=_SPLIT_TOL,
       - tail_strict=False（end 就是文件末尾）→ 同理，一路拷到 end。
     这样"全部保留"这种常见场景仍是 100% 无损流拷贝（实测 0.24s vs 3.3s）。
     """
-    inner = [k for k in kfs if start + tol < k < end - tol]
+    # 块内严格位于 (start+tol, end-tol) 的关键帧。kfs 升序，用 bisect 取区间
+    # （原来是一次列表推导线性扫描，保留段上千时这里是热点）。
+    lo = bisect.bisect_right(kfs, start + tol)
+    hi = bisect.bisect_left(kfs, end - tol)
+    inner = kfs[lo:hi]
 
     if head_strict and not inner:
         # 块内一个关键帧都没有（块比一个 GOP 还短）且起点必须精确 -> 整块重编码
-        k0 = max([k for k in kfs if k <= start + tol], default=0.0)
+        k0 = _kf_at_or_before(kfs, start + tol)
         return [("encode", start, end, max(0.0, k0))]
 
     parts = []
@@ -532,7 +548,7 @@ def _plan_block(kfs, start, end, tol=_SPLIT_TOL,
     if head_strict:
         k1 = inner[0]
         if k1 - cur > tol:                   # start 不在关键帧上 -> 重编码头部
-            k0 = max([k for k in kfs if k <= start + tol], default=0.0)
+            k0 = _kf_at_or_before(kfs, start + tol)
             parts.append(("encode", start, k1, max(0.0, k0)))
             cur = k1
 
@@ -592,10 +608,137 @@ def _part_cmd(ffmpeg, video_path, part, spec, encoder, preset, out_path):
     return cmd
 
 
+def _default_workers(encoder, n_parts):
+    """并行切割的并发数。
+
+    - 纯 copy 段（无损路线，encoder=None）：3 路。copy 段只做解复用+IO，
+      并发收益直接；每段是一次独立 ffmpeg，进程启动(~0.3s)在多段时被摊薄。
+    - NVENC 重编码段：2 路。消费级显卡并发编码会话数通常 ≤3，留余量免得到位
+      失败——失败会触发整条路线回退，代价比少一路并发大得多。
+    - libx264：3 路，多核 CPU 吃得下。
+    - 段数 ≤2 不起池（顺序跑更省）。
+    """
+    if n_parts <= 2:
+        return 1
+    return 2 if encoder == "h264_nvenc" else 3
+
+
+def _run_jobs_parallel(jobs, max_workers, progress_cb, tag,
+                       inactivity_timeout, sub_progress=False):
+    """并行跑一批互不依赖的 ffmpeg 切割任务。
+
+    jobs: ``[(i, cmd, out_path, dur, desc), ...]``，i 是段序号（结果按它归位）。
+    sub_progress: True 时按 ffmpeg 的 time= 行做段内细粒度进度（重编码段用）。
+
+    返回 ``(files, fail_msg)``：成功时 files[i] 是第 i 段产出；任一失败返回
+    ``(None, 详细错误)``，且不再向池里补新任务（已在跑的会跑完，无法中断
+    ffmpeg 子进程，但也就是几秒钟的事）。
+
+    线程安全：每段独立子进程/独立输出文件；共享的进度计数用锁保护；
+    progress_cb 由 GUI 提供（内部只往 queue 里 put），本身线程安全。
+    """
+    n = len(jobs)
+    total = sum(j[3] for j in jobs) or 1.0
+    results = [None] * n
+    # dur: 已完成段时长累计；live: 在跑段各自的当前输出时间；count: 完成
+    # 段数；last: 已发出的最大 frac（单调钳制）
+    state = {"dur": 0.0, "count": 0, "live": {}, "last": 0.0}
+    lock = threading.Lock()
+
+    def _emit(frac, label):
+        """发进度：只许前进、不许回退。
+
+        并发段的完成顺序 ≠ 提交顺序，各路 time= 行交替到达，锁内算出的
+        frac 完全可能「后算出高值、先到达 GUI」（竞态窗口 = 锁内计算到
+        回调之间）。GUI 的进度条是 FIFO 忠实执行，不回钳制就会肉眼可见
+        地回跳。这里用 last 兜底。
+        """
+        with lock:
+            if frac > state["last"]:
+                state["last"] = frac
+            else:
+                frac = state["last"]
+        if progress_cb:
+            progress_cb(frac, label)
+
+    def _run(job):
+        i, cmd, out_path, dur, desc = job
+
+        def _line(line):
+            # 段内细粒度进度：全局 frac = (已完成 + Σ在跑段当前进度) / 总时长。
+            # ⚠️ 不能用「本段 local」单兵作战——3 路并发时三路的 time= 行
+            # 交替到达，单段视角会锯齿振荡（用户实测 5%→7%→5% 来回跳），
+            # 必须汇总所有在跑段的实时进度才是真实总进度。
+            if not progress_cb:
+                return
+            t = _parse_time(line)
+            if t is None:
+                return
+            local = max(0.0, min(t, dur))
+            with lock:
+                state["live"][i] = local
+                frac = (state["dur"] + sum(state["live"].values())) / total
+                cnt = state["count"]
+            _emit(min(0.97, max(0.0, frac * 0.95)), f"{tag} {cnt}/{n}")
+
+        rc, err = run_capture(cmd, progress_cb=(_line if sub_progress else None),
+                              inactivity_timeout=inactivity_timeout)
+        ok = (rc == 0 and os.path.isfile(out_path)
+              and os.path.getsize(out_path) > 0)
+        with lock:
+            state["dur"] += dur
+            state["count"] += 1
+            # 本段已全额计入 dur，撤出 live，防止刚完成的段被双算
+            state["live"].pop(i, None)
+            # 同样用汇总公式：完成时若还有其他段在跑，真实进度高于
+            # 「仅已完成时长」（否则这个回调会被钳制成停滞）
+            frac = min(0.97, (state["dur"] + sum(state["live"].values()))
+                       / total * 0.95)
+            cnt = state["count"]
+        _emit(frac, f"{tag} {cnt}/{n}")
+        if not ok:
+            return (i, False,
+                    f"{desc}失败：\n命令: {' '.join(cmd)}\n返回码: {rc}\n"
+                    f"{err[-2500:]}")
+        results[i] = out_path
+        return (i, True, None)
+
+    if max_workers <= 1 or n <= 1:
+        for job in jobs:
+            _i, ok, msg = _run(job)
+            if not ok:
+                return None, msg
+        return results, None
+
+    fail_msg = None
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        pending = {}
+        nxt = 0
+        # 预填满池
+        while nxt < n and len(pending) < max_workers:
+            pending[ex.submit(_run, jobs[nxt])] = nxt
+            nxt += 1
+        while pending and fail_msg is None:
+            done, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+            for f in done:
+                pending.pop(f, None)
+                _i, ok, msg = f.result()
+                if not ok:
+                    fail_msg = msg
+                # 补位（保持池里有 max_workers 个在跑）
+                while nxt < n and len(pending) < max_workers and fail_msg is None:
+                    pending[ex.submit(_run, jobs[nxt])] = nxt
+                    nxt += 1
+        if fail_msg:
+            for f in pending:
+                f.cancel()      # 还没开始的直接取消；已在跑的跑完即止
+    return (None, fail_msg) if fail_msg else (results, None)
+
+
 def _render_parts(ffmpeg, video_path, parts, spec, encoder, preset,
                   tmp_dir, out_path, progress_cb, tag="切割", prefix="p",
                   attempt=0):
-    """执行 parts 计划：逐段跑 ffmpeg，再 concat -c copy 合成。
+    """执行 parts 计划：并行跑各段，再 concat -c copy 合成。
 
     parts: ``[(mode, a, b, dec_from), ...]``，mode ∈ {"copy", "encode"}。
     两条路线（lossless / smart cut）共用这一段，保证「跑段 + 合并」的行为
@@ -632,25 +775,23 @@ def _render_parts(ffmpeg, video_path, parts, spec, encoder, preset,
             progress_cb(1.0, "完成")
         return True, {"total_dur": total_dur, "enc_dur": enc_dur, "nparts": 1}
 
-    done = 0.0
-    files = []
+    # 多段：并行切割。段与段之间无依赖（各自 seek、各自输出文件），
+    # 段数多时（几十~上千）省下的是「每段一次的进程启动 + seek 开销」。
+    jobs = []
     for i, part in enumerate(parts):
         mode, a, b, _df = part
         seg_out = os.path.join(tmp_dir, f"{prefix}_{i:03d}.mp4")
         cmd = _part_cmd(ffmpeg, video_path, part, spec, encoder, preset,
                         seg_out)
-        rc, err = run_capture(cmd,
-                            inactivity_timeout=EXPORT_INACTIVITY_TIMEOUT)
-        if (rc != 0 or not os.path.isfile(seg_out)
-                or os.path.getsize(seg_out) == 0):
-            return False, (f"{tag} 第 {i + 1}/{len(parts)} 段({mode} "
-                           f"{a:.3f}-{b:.3f})失败 (attempt={attempt}):\n"
-                           f"命令: {' '.join(cmd)}\n返回码: {rc}\n{err[-2500:]}")
-        files.append(seg_out)
-        done += (b - a)
-        if progress_cb:
-            progress_cb(min(0.97, done / total_dur * 0.95),
-                        f"{tag} {i + 1}/{len(parts)}")
+        desc = f"{tag} 第 {i + 1}/{len(parts)} 段({mode} {a:.3f}-{b:.3f})"
+        jobs.append((i, cmd, seg_out, b - a, desc))
+
+    workers = _default_workers(encoder, len(parts))
+    files, fail = _run_jobs_parallel(jobs, workers, progress_cb, tag,
+                                     EXPORT_INACTIVITY_TIMEOUT,
+                                     sub_progress=True)
+    if fail:
+        return False, f"{fail} (attempt={attempt})"
 
     if progress_cb:
         progress_cb(0.97, "合并片段中…")
@@ -681,22 +822,16 @@ def _snap_head(kfs, t, tol=_SPLIT_TOL):
     """返回 >= t-tol 的第一个关键帧（只能向【前】吸附）。
 
     向前 = 少保留一点正片，但绝不把被丢弃的内容拷回来。没有则返回 None。
+    kfs 已升序，用 bisect 直接定位（保留段上千时比线性扫描快一个量级）。
     """
-    for k in kfs:
-        if k >= t - tol:
-            return k
-    return None
+    i = bisect.bisect_left(kfs, t - tol)
+    return kfs[i] if i < len(kfs) else None
 
 
 def _snap_tail(kfs, t, tol=_SPLIT_TOL):
     """返回 <= t+tol 的最后一个关键帧（只能向【后】吸附）。没有则 None。"""
-    best = None
-    for k in kfs:
-        if k <= t + tol:
-            best = k
-        else:
-            break
-    return best
+    i = bisect.bisect_right(kfs, t + tol)
+    return kfs[i - 1] if i > 0 else None
 
 
 def _plan_lossless(kfs, start, end, head_strict=True, tail_strict=True,
