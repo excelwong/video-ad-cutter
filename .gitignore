@@ -65,5 +65,8 @@ GITHUB_PUSH_STATE.md
 weights/
 **/weights/
 
-# ---- Benchmark / diagnostic scratch (2.7G 样本视频 + 临时输出，不入库) ----
-bench/
+# ---- Benchmark / diagnostic ----
+# 测试脚本与自检工具入库（曾被清理工具误删且无备份）；样本视频与临时产物除外
+bench/*.mp4
+bench/*.bin
+bench/tmp_*/

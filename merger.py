@@ -120,9 +120,9 @@ def _cut_cmd(ffmpeg, video_path, seg, target, out_path, encoder, preset, cq):
     if target["has_audio"]:
         cmd += ["-ar", str(target["sample_rate"]),
                 "-ac", str(target["channels"]), "-c:a", "aac"]
-    else:
-        cmd += ["-an"]
-    cmd += ["-movflags", "+faststart", out_path]
+    cmd += _stream_select(target["has_audio"])
+    cmd += ["-video_track_timescale", str(_PART_TIMESCALE),
+            "-movflags", "+faststart", out_path]
     return cmd
 
 
@@ -161,7 +161,8 @@ def _run_merge(ffmpeg, video_path, kept_scenes, out_path, target,
         for sf in seg_files:
             f.write(f"file '{os.path.abspath(sf)}'\n")
     concat_cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0",
-                  "-i", list_path, "-c", "copy", out_path]
+                  "-i", list_path, "-c", "copy",
+                  "-video_track_timescale", str(_PART_TIMESCALE), out_path]
     rc, err = run_capture(concat_cmd,
                         inactivity_timeout=EXPORT_INACTIVITY_TIMEOUT)
     if rc != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
@@ -230,6 +231,94 @@ def _looks_like_index_issue(msg):
     return any(k in low for k in _INDEX_KEYS)
 
 
+def _av_alignment_note(out_path):
+    """导出结果的音画健全性检查（只读前几个包 + 流时长，毫秒级开销）。
+
+    实验证明 copy 管线对「全局时间线统一平移」的片源恒保音画同步；但个别
+    片源的封装时间基异常（音视频 start_time 巨差、大量 B 帧导致的 seek
+    落点漂移）仍可能产生开头黑屏/结尾音画错位。这里量化两次并提示用户，
+    不判失败（差得少时播放器无感）。
+    """
+    try:
+        _, fp = get_ffmpeg()
+
+        def _first_pts(sel):
+            r = subprocess.run(
+                [fp, "-v", "error", "-select_streams", sel,
+                 "-read_intervals", "%+#4",
+                 "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+                 out_path],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=60)
+            for ln in r.stdout.splitlines():
+                ln = ln.strip().rstrip(",")
+                if not ln or ln.lower() == "n/a":
+                    continue
+                try:
+                    return float(ln)
+                except ValueError:
+                    continue
+            return None
+
+        def _dur(sel):
+            r = subprocess.run(
+                [fp, "-v", "error", "-select_streams", sel,
+                 "-show_entries", "stream=duration", "-of", "csv=p=0",
+                 out_path],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=60)
+            try:
+                v = float(r.stdout.strip().splitlines()[0])
+                return v if v > 0 else None
+            except (ValueError, IndexError):
+                return None
+
+        def _fps_pair(sel):
+            """返回 (avg_frame_rate, r_frame_rate)，解析失败返回 (0, 0)。"""
+            r = subprocess.run(
+                [fp, "-v", "error", "-select_streams", sel,
+                 "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                 "-of", "csv=p=0", out_path],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=60)
+            vals = []
+            for tok in r.stdout.strip().splitlines()[0].split(",") \
+                    if r.stdout.strip() else []:
+                try:
+                    n, d = tok.split("/")
+                    vals.append(float(n) / float(d) if float(d) else 0.0)
+                except (ValueError, ZeroDivisionError, IndexError):
+                    vals.append(0.0)
+            while len(vals) < 2:
+                vals.append(0.0)
+            return vals[0], vals[1]
+
+        vf, af = _first_pts("v:0"), _first_pts("a:0")
+        vd, ad = _dur("v:0"), _dur("a:0")
+        vavg, vref = _fps_pair("v:0")
+        notes = []
+        if vf is not None and af is not None and abs(vf - af) > 1.0:
+            notes.append(f"输出开头视频与音频的时间基相差 {abs(vf - af):.2f}s"
+                         "（可能表现为开头短暂黑屏或无声）。")
+        if vd and ad and abs(vd - ad) > 0.5:
+            notes.append(f"输出视频({vd:.1f}s)与音频({ad:.1f}s)时长相差 "
+                         f"{abs(vd - ad):.2f}s。")
+        if vref > 0 and vavg > 0 and vavg < 0.8 * vref:
+            # 平均帧率远低于标称帧率 = 时间戳被拉伸的指纹
+            # （2026-10-29 实锤：concat 时基不一致 tick 不换算，拉伸 ~1.95 倍，
+            #   avg 15.36 vs 标称 30）。纯视频输出时上面的时长差查不出来，
+            # 这条是独立哨兵。
+            notes.append(f"视频平均帧率 {vavg:.2f}fps 远低于标称 {vref:.2f}fps"
+                         "（时间戳疑似被拉伸，播放会音画错位/慢动作感）。")
+        if notes:
+            return ("\n⚠️ 检测到该片源封装时间基较特殊：" + " ".join(notes)
+                    + "\n若播放时音画不同步，请运行 bench/avsync_check.py "
+                    "并把诊断结果反馈给开发者。")
+    except Exception:
+        pass
+    return None
+
+
 def _rebuild_index(ffmpeg, video_path, tmp_dir):
     """重建视频索引（把 moov atom 移到文件头并重建索引）后返回新文件路径；失败返回 None。"""
     rb = os.path.join(tmp_dir, "_rebuilt_index.mp4")
@@ -276,20 +365,44 @@ def _write_error_log(app_dir, video_path, out_path, msg, kept_scenes):
     return log_path
 
 
-def _try_copy_cut(ffmpeg, video_path, kept_scenes, out_path,
+def _try_copy_cut(ffmpeg, ffprobe, video_path, kept_scenes, out_path,
                   tmp_dir, progress_cb, attempt):
     """用 -c copy 切割每个保留段 + concat -c copy 拼接（段间并行）。
+
+    兜底的兜底。切点【吸附到关键帧】（同 lossless 路线的方向规则：头只
+    向前、尾只向后），否则两个实锤问题：
+      1. `-ss` 落在非关键帧时视频回退到上一关键帧、把被丢弃内容拷回来
+         （实测多拷 1 个 GOP）；
+      2. 输出首包 pts 为负（实验 -1.0s），段间 concat 后起点错位。
+    关键帧表拿不到时保持旧行为（纯按时间切，起码能出片）。
 
     返回 (ok, error_msg)。成功时 error_msg 是成功提示；失败时包含失败命令与 ffmpeg stderr。
     """
     total = len(kept_scenes)
+    kfs = _keyframe_times(ffprobe, video_path) if ffprobe else []
+    try:
+        total_src = (float(probe_video(video_path).get("duration") or 0.0)
+                     if kfs else 0.0)
+    except Exception:
+        total_src = 0.0
     jobs = []
     for i, seg in enumerate(kept_scenes):
         seg_out = os.path.join(tmp_dir, f"seg_{i:03d}.mp4")
-        cmd = [ffmpeg, "-y", "-ss", f"{seg['start']:.3f}", "-i", video_path,
-               "-t", f"{seg['duration']:.3f}", "-c", "copy", seg_out]
+        a, b = float(seg["start"]), float(seg["start"]) + \
+            float(seg["duration"])
+        if kfs:
+            head_strict = a > _SPLIT_TOL
+            tail_strict = (total_src <= 0.0) or (b < total_src - _SPLIT_TOL)
+            ka = _snap_head(kfs, a) if head_strict else a
+            kb = _snap_tail(kfs, b) if tail_strict else b
+            if ka is not None and kb is not None and kb - ka > _MIN_PART:
+                a, b = ka, kb
+        cmd = [ffmpeg, "-y", "-ss", f"{a:.3f}", "-i", video_path,
+               "-t", f"{b - a:.3f}", "-c", "copy",
+               "-video_track_timescale", str(_PART_TIMESCALE),
+               *_stream_select(), seg_out]
         desc = f"片段 {i + 1}/{total} 流拷贝 (attempt={attempt})"
-        jobs.append((i, cmd, seg_out, float(seg["duration"]), desc))
+        jobs.append((i, cmd, seg_out, b - a, desc))
 
     # copy 段纯 IO，默认 3 路并发；段数 ≤2 时顺序跑
     workers = _default_workers(None, total)
@@ -305,7 +418,8 @@ def _try_copy_cut(ffmpeg, video_path, kept_scenes, out_path,
         for sf in seg_files:
             f.write(f"file '{os.path.abspath(sf)}'\n")
     concat_cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0",
-                  "-i", list_path, "-c", "copy", out_path]
+                  "-i", list_path, "-c", "copy",
+                  "-video_track_timescale", str(_PART_TIMESCALE), out_path]
     rc, err = run_capture(concat_cmd,
                         inactivity_timeout=EXPORT_INACTIVITY_TIMEOUT)
     if rc != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
@@ -568,12 +682,44 @@ def _plan_block(kfs, start, end, tol=_SPLIT_TOL,
     return parts
 
 
+# 所有切割段统一使用的视频轨 timescale（1/15360 秒 tick）。
+#
+# ⚠️ 这是「真实片源音画渐进错位」的根因修复（2026-10-29 用户真实片源实锤）：
+# 流拷贝段会继承片源视频时基（下载片源常见 1/30000，每帧 1000 tick），而
+# 重编码段的 mp4 默认时基是 1/15360（每帧 512 tick）。concat demuxer 对
+# 【时基不一致】的输入不做 tick 换算：一旦 concat 列表以重编码段开头
+# （smart cut 的头部重编码正是如此），outlink 时基被定成 1/15360，后面
+# copy 段的 tick 数被原样透传 —— 视频时间戳整体拉伸 30000/15360 ≈ 1.953 倍，
+# 表现为音画渐进漂移 + 视频有效帧率减半。实测真实片源：46s 内容被标成 88s；
+# 用户 8046s 片源导出后视频流标称 15631s（音频正常 8005s）。
+# 修法：给【每一个】切割段（copy 与 encode 一视同仁）显式钉死同一
+# timescale，让 concat 输入的时基永远同质，tick 换算不再需要也不会出错。
+# 15360 对 24/25/30/50/60/120fps 均有足够分辨率（每帧 ≥128 tick）。
+_PART_TIMESCALE = 15360
+
+def _stream_select(with_audio=True):
+    """显式流选择参数。
+
+    ⚠️ 下载片源常带「封面图」伪视频流（mjpeg）或多条音轨。不写 -map 时
+    ffmpeg 按「分辨率最高/声道最多」的默认规则选流——copy 段与 encode 段、
+    乃至段与段之间一旦选到不同的流，拼接结果就会音画错位或音轨突变。
+    显式钉死「第一条视频流 + 第一条音轨（有才选）」是确定性正解；
+    -sn 防字幕流混入 mp4。with_audio=False（纯视频输出）时不选音频。
+    """
+    maps = ["-map", "0:v:0"]
+    if with_audio:
+        maps += ["-map", "0:a:0?"]
+    return maps + ["-sn"]
+
+
 def _part_cmd(ffmpeg, video_path, part, spec, encoder, preset, out_path):
     """生成单个 part 的 ffmpeg 命令（copy 或 encode）。"""
     mode, a, b, dec_from = part
     if mode == "copy":
         return [ffmpeg, "-y", "-hide_banner", "-ss", f"{dec_from:.6f}",
-                "-i", video_path, "-t", f"{b - a:.6f}", "-c", "copy", out_path]
+                "-i", video_path, "-t", f"{b - a:.6f}", "-c", "copy",
+                "-video_track_timescale", str(_PART_TIMESCALE),
+                *_stream_select(), out_path]
 
     # encode：从 ≤ a 的关键帧开始解码，用 trim/atrim 精确截出 [a, b)
     pre = max(0.0, a - dec_from)
@@ -602,8 +748,10 @@ def _part_cmd(ffmpeg, video_path, part, spec, encoder, preset, out_path):
     if spec["has_audio"]:
         cmd += ["-ar", str(spec["sr"]), "-ac", str(spec["ch"]),
                 "-b:a", str(spec["abit"]), "-c:a", "aac"]
-    else:
-        cmd += ["-an"]
+    # encode 段也钉死同一 timescale：它的 mp4 默认时基（1/15360）在不同
+    # ffmpeg 构建下不保证一致，显式声明才能与 copy 段永远同质。
+    cmd += ["-video_track_timescale", str(_PART_TIMESCALE)]
+    cmd += _stream_select(spec["has_audio"])
     cmd += [out_path]
     return cmd
 
@@ -803,6 +951,7 @@ def _render_parts(ffmpeg, video_path, parts, spec, encoder, preset,
     # concat 输入实测 start=-0.023），会让播放器跳过开头一小段。
     cmd = [ffmpeg, "-y", "-hide_banner", "-f", "concat", "-safe", "0",
            "-i", list_path, "-c", "copy", "-avoid_negative_ts", "make_zero",
+           "-video_track_timescale", str(_PART_TIMESCALE),
            "-movflags", "+faststart", out_path]
     rc, err = run_capture(cmd)
     if rc != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
@@ -978,6 +1127,9 @@ def _try_lossless(ffmpeg, ffprobe, video_path, kept_scenes, out_path,
                     msg.append(f"    块{i + 1}: 头 +{h:.2f}s / 尾 -{t:.2f}s")
     else:
         msg.append("所有切点恰好落在关键帧上，未丢失任何内容。")
+    note = _av_alignment_note(out_path)
+    if note:
+        msg.append(note)
     return True, "\n".join(msg)
 
 
@@ -1021,10 +1173,14 @@ def _try_smartcut(ffmpeg, ffprobe, video_path, kept_scenes, out_path,
 
     pct = payload["enc_dur"] / payload["total_dur"] * 100 \
         if payload["total_dur"] else 0
-    return True, (f"已导出：{out_path}\n"
-                  f"共 {len(kept_scenes)} 段（合并为 {len(blocks)} 个连续块）；"
-                  f"仅切点处 {payload['enc_dur']:.1f}s 重新编码（占 {pct:.1f}%），"
-                  f"其余原编码流拷贝。")
+    tail = [f"已导出：{out_path}\n"
+            f"共 {len(kept_scenes)} 段（合并为 {len(blocks)} 个连续块）；"
+            f"仅切点处 {payload['enc_dur']:.1f}s 重新编码（占 {pct:.1f}%），"
+            f"其余原编码流拷贝。"]
+    note = _av_alignment_note(out_path)
+    if note:
+        tail.append(note)
+    return True, "\n".join(tail)
 
 
 def merge_streamcopy(video_path, kept_scenes, out_path, progress_cb=None,
@@ -1087,9 +1243,9 @@ def merge_streamcopy(video_path, kept_scenes, out_path, progress_cb=None,
                     logs.append(f"[{route} @ 重建索引]\n{msg}")
 
         # 兜底：逐段 -c copy + concat（切点对齐关键帧，可能有出入）
-        ok, fallback_msg = _try_copy_cut(ffmpeg, video_path, kept_scenes,
-                                         out_path, tmp_dir, progress_cb,
-                                         attempt=0)
+        ok, fallback_msg = _try_copy_cut(ffmpeg, ffprobe, video_path,
+                                         kept_scenes, out_path, tmp_dir,
+                                         progress_cb, attempt=0)
         if ok:
             return True, (fallback_msg +
                           "\n（注意：切点已对齐关键帧，可能有零点几秒出入）")
@@ -1097,8 +1253,9 @@ def merge_streamcopy(video_path, kept_scenes, out_path, progress_cb=None,
         if _looks_like_index_issue(fallback_msg):
             rb = _rebuild_index(ffmpeg, video_path, tmp_dir)
             if rb:
-                ok, msg3 = _try_copy_cut(ffmpeg, rb, kept_scenes, out_path,
-                                         tmp_dir, progress_cb, attempt=1)
+                ok, msg3 = _try_copy_cut(ffmpeg, ffprobe, rb, kept_scenes,
+                                         out_path, tmp_dir, progress_cb,
+                                         attempt=1)
                 if ok:
                     return True, msg3
                 fallback_msg = msg3
