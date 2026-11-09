@@ -84,6 +84,10 @@ def _fmt_export_status(frac, status, total_kept):
 
 
 class App:
+    # 滚轮一格 ≈ 3 行（约 48px）；高精度触控板/触屏的 delta 近似像素，按 1:1
+    _WHEEL_PX_PER_NOTCH = 48.0
+    _HIRES_WHEEL_SCALE = 1.0
+
     def __init__(self, root):
         self.root = root
         self.root.title("视频广告去除工具  ·  Video Ad Cutter")
@@ -138,6 +142,15 @@ class App:
         except Exception:
             pass
         self._dummy_var = tk.IntVar(value=0)  # 停放卡片的复选框变量
+
+        # ---------- 触摸屏双指滚动状态 ----------
+        # WNDPROC 回调里绝不能调用 Tk（见 _setup_dnd 的血泪注释），所以手势
+        # 只往这几个纯 Python 变量里写数值，真正的滚屏交给主线程轮询器。
+        self._touch_dy = 0.0        # 累积的待滚像素（正=向下看更多内容）
+        self._touch_pt = None       # 上一次 GID_PAN 的落点 y（屏幕坐标）
+        self._touch_seq = None      # 当前手势序列 ID（换手势要重置基准点）
+        self._canvas_hwnd = None    # 画布窗口句柄（判断手势落点用）
+        self._canvas_rect = (0, 0, 0, 0)   # 缓存的画布屏幕矩形（x, y, w, h）
 
         self._build()
         # 后台解码线程（整个进程生命周期内常驻，只消费队列）
@@ -194,6 +207,8 @@ class App:
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind_all("<Button-4>", self._on_mousewheel)  # Linux 上滚
         self.canvas.bind_all("<Button-5>", self._on_mousewheel)  # Linux 下滚
+        # 触摸屏：双指上下拖动 = 滚屏（Tk 不处理 WM_GESTURE，需接管窗口过程）
+        self._setup_touch_scroll()
 
         # Bottom controls
         bot = ttk.Frame(self.root, padding=8)
@@ -648,21 +663,255 @@ class App:
         self._refresh_target()
         self._refresh_highlights()
 
-    # ---------- rendering ----------
+    # ---------- 滚动（鼠标滚轮 / 触摸屏双指） ----------
     def _on_mousewheel(self, event):
-        """画布区域内的鼠标滚轮 → 纵向滚动。"""
+        """滚轮 → 画布纵向滚动（像素级）。
+
+        ⚠️ 旧写法 ``int(delta / 120)`` 的坑：只有传统滚轮的 delta 才是 120 的
+        整数倍；高精度触控板/双指滑动给出的是很小的值（常见 ±1~±120），
+        除以 120 再取整会被**截断成 0** —— 表现为「双指滑动完全不滚屏」。
+        所以这里改成按像素滚动，并对两类设备分别换算。
+        """
         cx, cy = self.canvas.winfo_rootx(), self.canvas.winfo_rooty()
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
         # 仅当指针落在画布滚动区时才接管滚动，否则放行给其它控件
         if not (cx <= event.x_root <= cx + cw and cy <= event.y_root <= cy + ch):
             return
-        if getattr(event, "delta", 0):        # Windows / 多数鼠标
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        elif getattr(event, "num", 0) == 4:   # Linux 上滚
-            self.canvas.yview_scroll(-1, "units")
-        elif getattr(event, "num", 0) == 5:   # Linux 下滚
-            self.canvas.yview_scroll(1, "units")
+        delta = getattr(event, "delta", 0)
+        if delta:                                    # Windows：滚轮 / 触控板
+            if abs(delta) >= 120:                    # 传统滚轮：按「格」换算
+                px = -delta / 120.0 * self._WHEEL_PX_PER_NOTCH
+            else:                                    # 高精度：delta 近似像素
+                px = -delta * self._HIRES_WHEEL_SCALE
+            self._scroll_canvas_pixels(px)
+        elif getattr(event, "num", 0) == 4:          # Linux 上滚
+            self._scroll_canvas_pixels(-self._WHEEL_PX_PER_NOTCH)
+        elif getattr(event, "num", 0) == 5:          # Linux 下滚
+            self._scroll_canvas_pixels(self._WHEEL_PX_PER_NOTCH)
         return "break"
+
+    def _scroll_canvas_pixels(self, delta):
+        """把画布内容滚动 delta 像素（正数 = 向下查看更多内容）。
+
+        鼠标滚轮与触摸屏双指共用同一条通路；虚拟化重绘由 _view_tick 兜底，
+        这里再立刻重排一次，触摸拖动才跟手（不必等 60ms 轮询）。
+        """
+        try:
+            parts = str(self.canvas.cget("scrollregion")).split()
+            if len(parts) < 4:
+                return
+            y0, y1 = float(parts[1]), float(parts[3])
+            view = float(self.canvas.winfo_height())
+        except Exception:
+            return
+        total = y1 - y0
+        if total <= 0 or view <= 0 or total <= view:
+            return                                   # 内容没超出视口，滚不动
+        top = self.canvas.yview()[0] * total
+        new_top = min(max(0.0, top + delta), max(0.0, total - view))
+        if abs(new_top - top) < 0.5:
+            return
+        self.canvas.yview_moveto(new_top / total)
+        try:
+            # 立刻重排，不等 60ms 轮询，触摸拖动才跟手。
+            # ⚠️ 必须带 scenes 守卫：_layout_visible 在无片段时会把
+            #    scrollregion 重置成 1x1（_view_tick 里同样是这么防的）。
+            if self.scenes:
+                self._layout_visible()
+        except Exception:
+            pass
+
+    # ---------- 触摸屏：双指上下拖动 = 滚屏 ----------
+    #
+    # 为什么用 WM_GESTURE 而不是 RegisterTouchWindow + WM_TOUCH：
+    # 注册触摸窗口会关闭 Windows 的「触摸 → 鼠标」模拟，单指点击卡片上的
+    # 复选框就失效了。WM_GESTURE 是 Windows 在【未注册触摸】时默认投递的
+    # 多指手势消息，只接管多指，单指点击仍走原来的鼠标消息，两者不冲突。
+    #
+    # Tk 完全不处理 WM_GESTURE，所以这里沿用拖放那套办法：ctypes 子类化
+    # 窗口过程接管消息，把「手指位移」累积进纯 Python 变量（回调里绝不碰
+    # Tk），再由主线程轮询器真正执行滚屏。
+    def _setup_touch_scroll(self):
+        """接管画布/主窗口的 WM_GESTURE(GID_PAN)，实现双指拖动滚屏。"""
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return
+        try:
+            user32 = ctypes.windll.user32
+        except Exception:
+            return
+
+        WM_GESTURE = 0x0119
+        GID_BEGIN, GID_END, GID_PAN = 1, 2, 4
+        # GC_*（winuser.h）：只要「两指」平移 —— 单指上下/左右平移显式 block，
+        # 这样单指拖动仍是点击/选择，不会被误判成滚屏；带惯性让滑动更顺滑。
+        GC_PAN = 0x00000001
+        GC_PAN_WITH_SINGLE_FINGER_VERTICALLY = 0x00000002
+        GC_PAN_WITH_SINGLE_FINGER_HORIZONTALLY = 0x00000004
+        GC_PAN_WITH_GUTTER = 0x00000008
+        GC_PAN_WITH_INERTIA = 0x00000010
+        GWL_WNDPROC = -4
+
+        class POINTS(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short)]
+
+        class GESTUREINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("dwFlags", wintypes.DWORD),
+                ("dwID", wintypes.DWORD),
+                ("hwndTarget", wintypes.HWND),
+                # ⚠️ 这里是 POINTS（两个 SHORT，4 字节）而不是 POINT（两个
+                #    LONG）——布局错一个字段，取出来的坐标就是垃圾值。
+                ("ptsLocation", POINTS),
+                ("dwInstanceID", wintypes.DWORD),
+                ("dwSequenceID", wintypes.DWORD),
+                ("ullArguments", ctypes.c_uint64),
+                ("cbExtraArgs", wintypes.UINT),
+            ]
+
+        class GESTURECONFIG(ctypes.Structure):
+            _fields_ = [("dwID", wintypes.DWORD), ("dwWant", wintypes.DWORD),
+                        ("dwBlock", wintypes.DWORD)]
+
+        try:
+            user32.GetGestureInfo.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(GESTUREINFO)]
+            user32.GetGestureInfo.restype = wintypes.BOOL
+            user32.CloseGestureInfoHandle.argtypes = [wintypes.HANDLE]
+            user32.SetGestureConfig.argtypes = [
+                wintypes.HWND, wintypes.DWORD, wintypes.UINT,
+                ctypes.POINTER(GESTURECONFIG), wintypes.UINT]
+            user32.SetGestureConfig.restype = wintypes.BOOL
+            user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.SetWindowLongPtrW.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            user32.CallWindowProcW.restype = ctypes.c_int64
+            user32.CallWindowProcW.argtypes = [
+                ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                wintypes.WPARAM, wintypes.LPARAM]
+        except Exception:
+            return                                   # 老系统没有手势 API
+
+        WndProc = ctypes.WINFUNCTYPE(
+            ctypes.c_int64, wintypes.HWND, wintypes.UINT,
+            wintypes.WPARAM, wintypes.LPARAM)
+
+        def _install(widget):
+            hwnd = widget.winfo_id()
+            if not hwnd:
+                return None
+            cfg = GESTURECONFIG(
+                GID_PAN,
+                GC_PAN | GC_PAN_WITH_GUTTER | GC_PAN_WITH_INERTIA,
+                GC_PAN_WITH_SINGLE_FINGER_VERTICALLY
+                | GC_PAN_WITH_SINGLE_FINGER_HORIZONTALLY)
+            try:
+                user32.SetGestureConfig(hwnd, 0, 1, ctypes.byref(cfg),
+                                        ctypes.sizeof(GESTURECONFIG))
+            except Exception:
+                pass
+            old_proc = user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+            if not old_proc:
+                return None
+
+            def wndproc(h, msg, wp, lp):
+                if msg == WM_GESTURE:
+                    handled = False
+                    try:
+                        gi = GESTUREINFO()
+                        gi.cbSize = ctypes.sizeof(GESTUREINFO)
+                        if user32.GetGestureInfo(lp, ctypes.byref(gi)):
+                            if gi.dwID == GID_PAN:
+                                # 只跟纵向位移：需求是「上下滑动 = 滚屏」
+                                if self._gesture_over_canvas(
+                                        gi.hwndTarget,
+                                        gi.ptsLocation.x, gi.ptsLocation.y):
+                                    self._feed_pan(gi.dwSequenceID,
+                                                   gi.ptsLocation.y)
+                                    handled = True
+                            elif gi.dwID in (GID_BEGIN, GID_END):
+                                self._touch_pt = None   # 手势起止：重置基准点
+                    except Exception:
+                        handled = False
+                    if handled:
+                        # 处理过的手势必须关闭句柄，否则泄漏触摸输入内存
+                        try:
+                            user32.CloseGestureInfoHandle(lp)
+                        except Exception:
+                            pass
+                        return 0
+                    # 未处理的手势（含 GID_BEGIN/END 的遗留支持）必须转交
+                    # 原窗口过程，否则既不处理又泄漏句柄。
+                return user32.CallWindowProcW(old_proc, h, msg, wp, lp)
+
+            new_proc = WndProc(wndproc)
+            try:
+                user32.SetWindowLongPtrW(
+                    hwnd, GWL_WNDPROC, ctypes.cast(new_proc, ctypes.c_void_p))
+            except Exception:
+                return None
+            widget._gesture_wndproc = new_proc         # 保活：回调不能被回收
+            return hwnd
+
+        try:
+            # 先画布（手势若投递到画布子窗口则由它先接），再主窗口兜底
+            self._canvas_hwnd = _install(self.canvas)
+            _install(self.root)
+            self._cache_canvas_rect()
+            self.root.after(16, self._touch_scroll_tick)
+        except Exception:
+            pass
+
+    def _feed_pan(self, seq, y):
+        """WNDPROC 专用：累积手指纵向位移（只写 Python 变量，绝不碰 Tk）。"""
+        if seq != self._touch_seq:
+            self._touch_seq = seq
+            self._touch_pt = None
+        prev = self._touch_pt
+        self._touch_pt = y
+        if prev is None:
+            # MSDN：首个 GID_PAN 只表示手势开始、不产生位移，仅定基准
+            return
+        dy = y - prev
+        if dy:
+            self._touch_dy -= dy        # 手指上滑(dy<0) → 内容上移 → 往下看
+
+    def _gesture_over_canvas(self, hwnd_target, x, y):
+        """手势落点是否在画布内（用缓存矩形，WNDPROC 里不能调 Tk）。"""
+        if self._canvas_hwnd and hwnd_target == self._canvas_hwnd:
+            return True
+        x0, y0, w, h = self._canvas_rect
+        if w <= 0 or h <= 0:
+            return False
+        return x0 <= x <= x0 + w and y0 <= y <= y0 + h
+
+    def _cache_canvas_rect(self):
+        """缓存画布屏幕矩形，供 WNDPROC 判断落点（只能在主线程调用 Tk）。"""
+        try:
+            self._canvas_rect = (self.canvas.winfo_rootx(),
+                                 self.canvas.winfo_rooty(),
+                                 self.canvas.winfo_width(),
+                                 self.canvas.winfo_height())
+        except Exception:
+            pass
+
+    def _touch_scroll_tick(self):
+        """主线程消费 WNDPROC 累积的触摸位移（Tk 操作只能在主线程做）。"""
+        dy = self._touch_dy
+        self._touch_dy = 0.0
+        if abs(dy) > 0.5:
+            try:
+                self._scroll_canvas_pixels(dy)
+            except Exception:
+                pass
+        self.root.after(16, self._touch_scroll_tick)
 
     def _reset(self):
         """清空当前视频的片段视图（池卡片保留复用，只是全部撤下屏幕）。"""
@@ -886,6 +1135,9 @@ class App:
     def _view_tick(self):
         """轮询重布局 + 贴图（Tk 没有 view-changed 事件，轮询最稳）。"""
         try:
+            # 画布屏幕矩形缓存：WNDPROC 判断手势落点要用，而回调里不能调 Tk
+            if self._canvas_hwnd:
+                self._cache_canvas_rect()
             if self.scenes:
                 frac = self.canvas.yview()
                 if frac != self._last_yview:
